@@ -30,9 +30,44 @@ services:
       timeout: 5s
       retries: 5
 
+  # Uses the dedicated initializer entrypoint that exists in the image
   initializer:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-initializer
+    entrypoint: ["/entrypoint-initializer.sh"]
+    environment:
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: database
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: ${DB_USER:-postgres}
+      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnopq}
+      DD_ALLOWED_HOSTS: "*"
+      DD_INITIALIZE: "true"
+      DD_ADMIN_USER: admin
+      DD_ADMIN_PASSWORD: ${DD_ADMIN_PASSWORD:-defectdojo}
+      DD_ADMIN_FIRST_NAME: Admin
+      DD_ADMIN_LAST_NAME: User
+      DD_ADMIN_MAIL: admin@defectdojo.local
+      # Broker — skip broker check in initializer since celery not needed for init
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - dojo_media:/app/media
+      - dojo_static:/app/static
+    networks:
+      - dojo-network
+
+  # Uses DD_UWSGI_MODE=http + DD_UWSGI_ENDPOINT to serve HTTP directly on 8080
+  uwsgi:
+    image: defectdojo/defectdojo-django:latest
+    container_name: dojo-uwsgi
     entrypoint: ["/entrypoint-uwsgi.sh"]
     environment:
       DD_DATABASE_ENGINE: django.db.backends.postgresql
@@ -41,41 +76,17 @@ services:
       DD_DATABASE_NAME: defectdojo
       DD_DATABASE_USER: ${DB_USER:-postgres}
       DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
-      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
-      DD_ALLOWED_HOSTS: "*"
-      DD_INITIALIZE: "true"
-      DD_ADMIN_USER: admin
-      DD_ADMIN_PASSWORD: ${DD_ADMIN_PASSWORD:-defectdojo}
-      DD_ADMIN_FIRST_NAME: Admin
-      DD_ADMIN_LAST_NAME: User
-      DD_ADMIN_MAIL: admin@defectdojo.local
-    depends_on:
-      database:
-        condition: service_healthy
-    volumes:
-      - dojo_media:/app/media
-      - dojo_static:/app/static
-    networks:
-      - dojo-network
-
-  uwsgi:
-    image: defectdojo/defectdojo-django:latest
-    container_name: dojo-uwsgi
-    environment:
-      DD_DATABASE_ENGINE: django.db.backends.postgresql
-      DD_DATABASE_HOST: database
-      DD_DATABASE_PORT: "5432"
-      DD_DATABASE_NAME: defectdojo
-      DD_DATABASE_USER: ${DB_USER:-postgres}
-      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
-      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnopq}
       DD_ALLOWED_HOSTS: "*"
       DD_CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
       DD_SESSION_COOKIE_SECURE: "False"
       DD_CSRF_COOKIE_SECURE: "False"
-      DD_UWSGI_PORT: "8080"
-      DD_UWSGI_NUM_PROCESSES: "2"
-      DD_UWSGI_NUM_THREADS: "2"
+      # These two vars make uwsgi serve plain HTTP on 8080 instead of socket on 3031
+      DD_UWSGI_MODE: http
+      DD_UWSGI_ENDPOINT: "0.0.0.0:8080"
+      DD_UWSGI_NUM_OF_PROCESSES: "2"
+      DD_UWSGI_NUM_OF_THREADS: "2"
     ports:
       - "8080:8080"
     volumes:
@@ -101,9 +112,12 @@ services:
       DD_DATABASE_NAME: defectdojo
       DD_DATABASE_USER: ${DB_USER:-postgres}
       DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
-      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
-      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnopq}
       DD_ALLOWED_HOSTS: "*"
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      DD_CELERY_LOG_LEVEL: INFO
+      DD_CELERY_WORKER_POOL_TYPE: solo
     networks:
       - dojo-network
     depends_on:
@@ -124,9 +138,10 @@ services:
       DD_DATABASE_NAME: defectdojo
       DD_DATABASE_USER: ${DB_USER:-postgres}
       DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
-      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
-      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnopq}
       DD_ALLOWED_HOSTS: "*"
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
     networks:
       - dojo-network
     depends_on:
