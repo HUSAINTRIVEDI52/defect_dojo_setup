@@ -128,6 +128,7 @@ jobs:
             ansible/site.yml \
             -e "db_password=${{ secrets.DB_PASSWORD }}" \
             -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
+            -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
             -v
 
       - name: Print access details

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
 
   # --- Shared Database ---
@@ -34,48 +32,46 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- Initializer (runs once to setup DB schema + admin user) ---
+  # --- Initializer (runs once: migrations + admin user) ---
   initializer:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-initializer
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        python3 manage.py migrate --noinput
-        python3 manage.py createsuperuser --noinput \
-          --username ${DD_ADMIN_USER:-admin} \
-          --email ${DD_ADMIN_MAIL:-admin@example.com} || true
-        python3 manage.py collectstatic --noinput
+    command: /wait-for-it.sh database:5432 -t 30 -- bash -c "
+      python manage.py migrate &&
+      python manage.py createsuperuser --noinput || true &&
+      python manage.py collectstatic --noinput"
     depends_on:
       database:
         condition: service_healthy
     environment:
-      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
+      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
       DD_ALLOWED_HOSTS: "*"
-      DJANGO_SUPERUSER_PASSWORD: ${DD_ADMIN_PASSWORD:-defectdojo}
+      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
+      DJANGO_SUPERUSER_USERNAME: "admin"
+      DJANGO_SUPERUSER_PASSWORD: "${DD_ADMIN_PASSWORD:-defectdojo}"
+      DJANGO_SUPERUSER_EMAIL: "admin@defectdojo.local"
+    volumes:
+      - dojo_media:/app/media
+      - dojo_static:/app/static
     networks:
       - dojo-network
 
-  # --- uWSGI (Main Django App — exposed on port 8080) ---
+  # --- uWSGI (Main Web App on port 8080) ---
   uwsgi:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-uwsgi
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        uwsgi --socket :8001 --wsgi-file wsgi.py \
-          --workers 2 --threads 2 \
-          --http :8080
+    command: /wait-for-it.sh database:5432 -t 30 -- uwsgi --http 0.0.0.0:8080 --wsgi dojo.wsgi:application --workers 2 --threads 2 --static-map /static=/app/static
     depends_on:
       database:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
-      DD_REDIS_URL: redis://redis:6379/0
-      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
+      DD_REDIS_URL: "redis://redis:6379/0"
       DD_ALLOWED_HOSTS: "*"
+      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
       DD_SESSION_COOKIE_SECURE: "False"
       DD_CSRF_COOKIE_SECURE: "False"
     ports:
@@ -87,40 +83,42 @@ services:
       - dojo-network
     restart: unless-stopped
 
-  # --- Celery Worker (async tasks: imports, notifications) ---
+  # --- Celery Worker ---
   celery_worker:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-celery-worker
-    command: celery -A dojo worker -l INFO --concurrency 2
+    command: /wait-for-it.sh database:5432 -t 30 -- celery --app=dojo.celery:app worker --loglevel=info --concurrency 2
     depends_on:
       database:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
-      DD_REDIS_URL: redis://redis:6379/0
-      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
+      DD_REDIS_URL: "redis://redis:6379/0"
       DD_ALLOWED_HOSTS: "*"
+      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
     networks:
       - dojo-network
     restart: unless-stopped
 
-  # --- Celery Beat (scheduled tasks: deduplication, SLA checks) ---
+  # --- Celery Beat ---
   celery_beat:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-celery-beat
-    command: celery -A dojo beat -l INFO
+    command: /wait-for-it.sh database:5432 -t 30 -- celery --app=dojo.celery:app beat --loglevel=info
     depends_on:
       database:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
-      DD_REDIS_URL: redis://redis:6379/0
-      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
+      DD_REDIS_URL: "redis://redis:6379/0"
       DD_ALLOWED_HOSTS: "*"
+      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
     networks:
       - dojo-network
     restart: unless-stopped

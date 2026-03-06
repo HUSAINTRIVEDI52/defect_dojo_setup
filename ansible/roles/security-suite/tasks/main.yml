@@ -32,10 +32,7 @@
       DB_USER=postgres
       DB_PASSWORD={{ db_password }}
       DD_ADMIN_PASSWORD={{ dd_admin_password }}
-      DD_ADMIN_USER=admin
-      DD_ADMIN_FIRST_NAME=Admin
-      DD_ADMIN_LAST_NAME=User
-      DD_ADMIN_MAIL=admin@example.com
+      DD_SECRET_KEY={{ dd_secret_key }}
   become: yes
 
 - name: Pull latest DefectDojo images
@@ -44,6 +41,13 @@
     chdir: /opt/defectdojo
   become: yes
 
+- name: Tear down any previous containers and volumes (clean slate)
+  shell: docker compose down -v --remove-orphans
+  args:
+    chdir: /opt/defectdojo
+  become: yes
+  ignore_errors: yes
+
 - name: Start database and redis first
   shell: docker compose up -d database redis
   args:
@@ -51,8 +55,7 @@
   become: yes
 
 - name: Wait for PostgreSQL to be ready
-  shell: |
-    docker exec defectdojo-db pg_isready -U postgres
+  shell: docker exec defectdojo-db pg_isready -U postgres
   register: pg_ready
   until: pg_ready.rc == 0
   retries: 20
