@@ -1,0 +1,52 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfvars.json
+tfplan*
+.terraform.lock.hcl
+
+# AWS
+.aws/
+credentials
+access_key
+secret_key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env/
+
+# Ansible
+*.retry
+ansible_*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+dist/
+build/
+*.bak
+*.tmp
+*.log
+docker-build.log
+terraform-apply.log
+
+# Node (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Markdown
+*.md
+!README.md
+
+# Reference Docs
+_reference_docs/

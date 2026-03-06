@@ -1,0 +1,97 @@
+---
+- name: Create deployment directory
+  file:
+    path: /opt/defectdojo
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  become: yes
+
+- name: Deploy docker-compose.yml
+  copy:
+    src: docker-compose.yml
+    dest: /opt/defectdojo/docker-compose.yml
+    mode: '0644'
+    force: yes
+  become: yes
+
+- name: Deploy init-db.sh
+  copy:
+    src: init-db.sh
+    dest: /opt/defectdojo/init-db.sh
+    mode: '0755'
+    force: yes
+  become: yes
+
+- name: Write .env file with secrets
+  copy:
+    dest: /opt/defectdojo/.env
+    mode: '0600'
+    content: |
+      DB_USER=postgres
+      DB_PASSWORD={{ db_password }}
+      DD_ADMIN_PASSWORD={{ dd_admin_password }}
+      DD_ADMIN_USER=admin
+      DD_ADMIN_FIRST_NAME=Admin
+      DD_ADMIN_LAST_NAME=User
+      DD_ADMIN_MAIL=admin@example.com
+  become: yes
+
+- name: Pull latest DefectDojo images
+  shell: docker compose pull
+  args:
+    chdir: /opt/defectdojo
+  become: yes
+
+- name: Start database and redis first
+  shell: docker compose up -d database redis
+  args:
+    chdir: /opt/defectdojo
+  become: yes
+
+- name: Wait for PostgreSQL to be ready
+  shell: |
+    docker exec defectdojo-db pg_isready -U postgres
+  register: pg_ready
+  until: pg_ready.rc == 0
+  retries: 20
+  delay: 5
+  become: yes
+
+- name: Run DefectDojo initializer
+  shell: docker compose up initializer
+  args:
+    chdir: /opt/defectdojo
+  become: yes
+
+- name: Wait for initializer to complete
+  shell: |
+    STATUS=$(docker inspect --format='{{.State.ExitCode}}' dojo-initializer 2>/dev/null || echo "missing")
+    echo $STATUS
+  register: init_exit
+  until: init_exit.stdout == "0"
+  retries: 40
+  delay: 15
+  become: yes
+
+- name: Start remaining DefectDojo services
+  shell: docker compose up -d uwsgi celery_worker celery_beat
+  args:
+    chdir: /opt/defectdojo
+  become: yes
+
+- name: Wait for DefectDojo to be accessible on port 8080
+  uri:
+    url: "http://127.0.0.1:8080/login?next=/"
+    method: GET
+    status_code: 200
+  register: dojo_check
+  until: dojo_check.status == 200
+  retries: 40
+  delay: 15
+  become: yes
+
+- name: Print DefectDojo access info
+  debug:
+    msg: "DefectDojo is UP at http://{{ ansible_host }}:8080 — Login: admin / {{ dd_admin_password }}"

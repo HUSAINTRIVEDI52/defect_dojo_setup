@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+
+  # --- Shared Database ---
+  database:
+    image: postgres:15-alpine
+    container_name: defectdojo-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      POSTGRES_DB: defectdojo
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - dojo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis (Celery Broker) ---
+  redis:
+    image: redis:7-alpine
+    container_name: dojo-redis
+    networks:
+      - dojo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Initializer (runs once to setup DB schema + admin user) ---
+  initializer:
+    image: defectdojo/defectdojo-django:latest
+    container_name: dojo-initializer
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        python3 manage.py migrate --noinput
+        python3 manage.py createsuperuser --noinput \
+          --username ${DD_ADMIN_USER:-admin} \
+          --email ${DD_ADMIN_MAIL:-admin@example.com} || true
+        python3 manage.py collectstatic --noinput
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
+      DD_ALLOWED_HOSTS: "*"
+      DJANGO_SUPERUSER_PASSWORD: ${DD_ADMIN_PASSWORD:-defectdojo}
+    networks:
+      - dojo-network
+
+  # --- uWSGI (Main Django App — exposed on port 8080) ---
+  uwsgi:
+    image: defectdojo/defectdojo-django:latest
+    container_name: dojo-uwsgi
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        uwsgi --socket :8001 --wsgi-file wsgi.py \
+          --workers 2 --threads 2 \
+          --http :8080
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
+      DD_REDIS_URL: redis://redis:6379/0
+      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_ALLOWED_HOSTS: "*"
+      DD_SESSION_COOKIE_SECURE: "False"
+      DD_CSRF_COOKIE_SECURE: "False"
+    ports:
+      - "8080:8080"
+    volumes:
+      - dojo_media:/app/media
+      - dojo_static:/app/static
+    networks:
+      - dojo-network
+    restart: unless-stopped
+
+  # --- Celery Worker (async tasks: imports, notifications) ---
+  celery_worker:
+    image: defectdojo/defectdojo-django:latest
+    container_name: dojo-celery-worker
+    command: celery -A dojo worker -l INFO --concurrency 2
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
+      DD_REDIS_URL: redis://redis:6379/0
+      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_ALLOWED_HOSTS: "*"
+    networks:
+      - dojo-network
+    restart: unless-stopped
+
+  # --- Celery Beat (scheduled tasks: deduplication, SLA checks) ---
+  celery_beat:
+    image: defectdojo/defectdojo-django:latest
+    container_name: dojo-celery-beat
+    command: celery -A dojo beat -l INFO
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DD_DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo
+      DD_REDIS_URL: redis://redis:6379/0
+      DD_CELERY_BROKER_URL: redis://redis:6379/1
+      DD_ALLOWED_HOSTS: "*"
+    networks:
+      - dojo-network
+    restart: unless-stopped
+
+networks:
+  dojo-network:
+    name: defectdojo-net
+    driver: bridge
+
+volumes:
+  db_data:
+  dojo_media:
+  dojo_static:
