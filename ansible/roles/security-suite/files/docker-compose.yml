@@ -1,6 +1,5 @@
 services:
 
-  # --- Shared Database ---
   database:
     image: postgres:15-alpine
     container_name: defectdojo-db
@@ -19,7 +18,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- Redis (Celery Broker) ---
   redis:
     image: redis:7-alpine
     container_name: dojo-redis
@@ -32,48 +30,52 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- Initializer (runs once: migrations + admin user) ---
   initializer:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-initializer
-    command: /wait-for-it.sh database:5432 -t 30 -- bash -c "
-      python manage.py migrate &&
-      python manage.py createsuperuser --noinput || true &&
-      python manage.py collectstatic --noinput"
+    entrypoint: ["/entrypoint-uwsgi.sh"]
+    environment:
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: database
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: ${DB_USER:-postgres}
+      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
+      DD_ALLOWED_HOSTS: "*"
+      DD_INITIALIZE: "true"
+      DD_ADMIN_USER: admin
+      DD_ADMIN_PASSWORD: ${DD_ADMIN_PASSWORD:-defectdojo}
+      DD_ADMIN_FIRST_NAME: Admin
+      DD_ADMIN_LAST_NAME: User
+      DD_ADMIN_MAIL: admin@defectdojo.local
     depends_on:
       database:
         condition: service_healthy
-    environment:
-      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
-      DD_ALLOWED_HOSTS: "*"
-      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
-      DJANGO_SUPERUSER_USERNAME: "admin"
-      DJANGO_SUPERUSER_PASSWORD: "${DD_ADMIN_PASSWORD:-defectdojo}"
-      DJANGO_SUPERUSER_EMAIL: "admin@defectdojo.local"
     volumes:
       - dojo_media:/app/media
       - dojo_static:/app/static
     networks:
       - dojo-network
 
-  # --- uWSGI (Main Web App on port 8080) ---
   uwsgi:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-uwsgi
-    command: /wait-for-it.sh database:5432 -t 30 -- uwsgi --http 0.0.0.0:8080 --wsgi dojo.wsgi:application --workers 2 --threads 2 --static-map /static=/app/static
-    depends_on:
-      database:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
-      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
-      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
-      DD_REDIS_URL: "redis://redis:6379/0"
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: database
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: ${DB_USER:-postgres}
+      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
       DD_ALLOWED_HOSTS: "*"
-      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
       DD_SESSION_COOKIE_SECURE: "False"
       DD_CSRF_COOKIE_SECURE: "False"
+      DD_UWSGI_PORT: "8080"
+      DD_UWSGI_NUM_PROCESSES: "2"
+      DD_UWSGI_NUM_THREADS: "2"
     ports:
       - "8080:8080"
     volumes:
@@ -81,46 +83,57 @@ services:
       - dojo_static:/app/static
     networks:
       - dojo-network
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
-  # --- Celery Worker ---
   celery_worker:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-celery-worker
-    command: /wait-for-it.sh database:5432 -t 30 -- celery --app=dojo.celery:app worker --loglevel=info --concurrency 2
+    entrypoint: ["/entrypoint-celery-worker.sh"]
+    environment:
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: database
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: ${DB_USER:-postgres}
+      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      DD_ALLOWED_HOSTS: "*"
+    networks:
+      - dojo-network
     depends_on:
       database:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
-      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
-      DD_REDIS_URL: "redis://redis:6379/0"
-      DD_ALLOWED_HOSTS: "*"
-      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
-    networks:
-      - dojo-network
     restart: unless-stopped
 
-  # --- Celery Beat ---
   celery_beat:
     image: defectdojo/defectdojo-django:latest
     container_name: dojo-celery-beat
-    command: /wait-for-it.sh database:5432 -t 30 -- celery --app=dojo.celery:app beat --loglevel=info
+    entrypoint: ["/entrypoint-celery-beat.sh"]
+    environment:
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: database
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: ${DB_USER:-postgres}
+      DD_DATABASE_PASSWORD: ${DB_PASSWORD:-defectdojopassword}
+      DD_SECRET_KEY: ${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}
+      DD_CELERY_BROKER_URL: redis://redis:6379/0
+      DD_ALLOWED_HOSTS: "*"
+    networks:
+      - dojo-network
     depends_on:
       database:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      DD_DATABASE_URL: "postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-defectdojopassword}@database:5432/defectdojo"
-      DD_CELERY_BROKER_URL: "redis://redis:6379/0"
-      DD_REDIS_URL: "redis://redis:6379/0"
-      DD_ALLOWED_HOSTS: "*"
-      DD_SECRET_KEY: "${DD_SECRET_KEY:-verySecretKey1234567890abcdefghijklmnop}"
-    networks:
-      - dojo-network
     restart: unless-stopped
 
 networks:
