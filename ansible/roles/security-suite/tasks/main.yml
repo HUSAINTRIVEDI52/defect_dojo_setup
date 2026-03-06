@@ -65,16 +65,6 @@
     chdir: /opt/defectdojo
   become: yes
 
-- name: Wait for initializer to complete
-  shell: |
-    STATUS=$(docker inspect --format='{{.State.ExitCode}}' dojo-initializer 2>/dev/null || echo "missing")
-    echo $STATUS
-  register: init_exit
-  until: init_exit.stdout == "0"
-  retries: 40
-  delay: 15
-  become: yes
-
 - name: Start remaining DefectDojo services
   shell: docker compose up -d uwsgi celery_worker celery_beat
   args:
