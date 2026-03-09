@@ -24,7 +24,7 @@ variable "instance_name" {
 variable "machine_type" {
   description = "GCP machine type — e2-standard-4 is minimum recommended for DefectDojo"
   type        = string
-  default     = "e2-standard-2"   # 4 vCPU, 16GB RAM
+  default     = "e2-medium"   # 4 vCPU, 16GB RAM
 }
 
 variable "service_account_email" {
