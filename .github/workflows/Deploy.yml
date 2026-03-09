@@ -1,9 +1,6 @@
 name: Infrastructure Setup (Permanent)
 
 on:
-  push:
-    branches:
-      - Infra-Pipeline
   workflow_dispatch:
 
 env:
@@ -11,6 +8,7 @@ env:
   GCP_REGION: us-central1
   GCP_ZONE: us-central1-a
   VM_USER: ubuntu
+  INSTANCE_NAME: defectdojo-vm  # fallback in case Terraform output fails
 
 jobs:
   provision:
@@ -37,17 +35,17 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Apply
-         working-directory: infrastructure/gcp
-         run: |
-           terraform init
+        working-directory: infrastructure/gcp     # ← fixed indentation (2 spaces, not 3)
+        run: |
+          terraform init
 
-           terraform apply -auto-approve \
-              -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
-              -var="region=${{ env.GCP_REGION }}" \
-              -var="zone=${{ env.GCP_ZONE }}"
+          terraform apply -auto-approve \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="region=${{ env.GCP_REGION }}" \
+            -var="zone=${{ env.GCP_ZONE }}"
 
-            echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
-            echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
+          echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
+          echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
 
       # ── SSH Key (temp, generated fresh every run) ───────────────────────────
       - name: Generate temporary SSH key
@@ -57,7 +55,6 @@ jobs:
 
       - name: Push SSH public key to VM via gcloud
         run: |
-          # Waits until the VM is ready before pushing the key
           echo "⏳ Waiting for VM to be ready..."
           for i in $(seq 1 12); do
             STATUS=$(gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
@@ -71,7 +68,6 @@ jobs:
             sleep 10
           done
 
-          # Push the temp public key to VM metadata
           gcloud compute instances add-metadata ${{ env.INSTANCE_NAME }} \
             --zone=${{ env.GCP_ZONE }} \
             --metadata="ssh-keys=${{ env.VM_USER }}:$(cat ~/.ssh/deploy_key.pub)"
@@ -156,14 +152,14 @@ jobs:
       - name: Remove temporary SSH key from VM
         if: always()
         run: |
-           if [ -n "${{ env.INSTANCE_NAME }}" ]; then
-               gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
-                 --zone=${{ env.GCP_ZONE }} \
-                  --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
-                 echo "✅ Temporary SSH key removed from VM"
-               else
-                 echo "⚠️ INSTANCE_NAME not set (Terraform likely failed), skipping cleanup"
-                fi  
+          if [ -n "${{ env.INSTANCE_NAME }}" ]; then
+            gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
+              --zone=${{ env.GCP_ZONE }} \
+              --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
+            echo "✅ Temporary SSH key removed from VM"
+          else
+            echo "⚠️ INSTANCE_NAME not set, skipping cleanup"
+          fi
 
       # ── Summary ─────────────────────────────────────────────────────────────
       - name: Print deployment summary
