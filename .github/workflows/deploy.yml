@@ -169,14 +169,9 @@ jobs:
       - name: Remove temporary SSH key from VM
         if: always()
         run: |
-          if [ -n "${{ env.INSTANCE_NAME }}" ]; then
-            gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
-              --zone=${{ env.GCP_ZONE }} \
-              --keys="ssh-keys" || echo "Could not remove SSH key metadata"
-            echo "Temporary SSH key removed from VM"
-          else
-            echo "INSTANCE_NAME not set, skipping cleanup"
-          fi
+          gcloud compute instances remove-metadata defectdojo-vm \
+           --zone us-central1-a \
+           --keys ssh-keys || true
 
       - name: Print deployment summary
         if: success()
