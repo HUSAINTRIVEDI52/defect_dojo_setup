@@ -8,7 +8,8 @@ env:
   GCP_REGION: us-central1
   GCP_ZONE: us-central1-a
   VM_USER: ubuntu
-  INSTANCE_NAME: defectdojo-vm  # fallback in case Terraform output fails
+  # Fallback in case Terraform output fails
+  INSTANCE_NAME: defectdojo-vm
 
 jobs:
   provision:
@@ -35,7 +36,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Apply
-        working-directory: infrastructure/gcp     # ← fixed indentation (2 spaces, not 3)
+        working-directory: infrastructure/gcp
         run: |
           terraform init
 
@@ -51,18 +52,18 @@ jobs:
       - name: Generate temporary SSH key
         run: |
           ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
-          echo "✅ SSH key generated"
+          echo "SSH key generated"
 
       - name: Push SSH public key to VM via gcloud
         run: |
-          echo "⏳ Waiting for VM to be ready..."
+          echo "Waiting for VM to be ready..."
           for i in $(seq 1 12); do
             STATUS=$(gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
               --zone=${{ env.GCP_ZONE }} \
               --format="value(status)")
             echo "  VM status: $STATUS"
             if [ "$STATUS" = "RUNNING" ]; then
-              echo "✅ VM is running"
+              echo "VM is running"
               break
             fi
             sleep 10
@@ -72,11 +73,11 @@ jobs:
             --zone=${{ env.GCP_ZONE }} \
             --metadata="ssh-keys=${{ env.VM_USER }}:$(cat ~/.ssh/deploy_key.pub)"
 
-          echo "✅ SSH public key pushed to VM"
+          echo "SSH public key pushed to VM"
 
       - name: Test SSH connection
         run: |
-          echo "⏳ Waiting for SSH to be available..."
+          echo "Waiting for SSH to be available..."
           sleep 15
 
           for i in $(seq 1 10); do
@@ -84,8 +85,8 @@ jobs:
                 -o StrictHostKeyChecking=no \
                 -o ConnectTimeout=10 \
                 ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} \
-                "echo '✅ SSH connection successful'"; then
-              echo "✅ SSH is ready"
+                "echo SSH connection successful"; then
+              echo "SSH is ready"
               break
             else
               echo "  Attempt $i/10 - retrying in 10s..."
@@ -103,7 +104,7 @@ jobs:
             ansible.tar.gz \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }}:~/ansible.tar.gz
 
-          echo "✅ Ansible files copied"
+          echo "Ansible files copied"
 
       - name: Run Ansible playbook on VM
         run: |
@@ -112,27 +113,27 @@ jobs:
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
               set -e
 
-              echo "📦 Installing dependencies..."
+              echo "Installing dependencies..."
               sudo apt-get update -qq
               sudo apt-get install -y ansible docker.io docker-compose-v2
 
-              echo "📂 Extracting Ansible files..."
+              echo "Extracting Ansible files..."
               tar -xzf ~/ansible.tar.gz
 
-              echo "🚀 Running Ansible playbook..."
+              echo "Running Ansible playbook..."
               cd ~/ansible
               sudo ansible-playbook -i localhost, -c local site.yml \
                 -e "db_password=${{ secrets.DB_PASSWORD }}" \
                 -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
                 -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}"
 
-              echo "✅ Ansible completed"
+              echo "Ansible completed"
           ENDSSH
 
       # ── Verify ──────────────────────────────────────────────────────────────
       - name: Verify DefectDojo is accessible
         run: |
-          echo "⏳ Waiting for DefectDojo to start..."
+          echo "Waiting for DefectDojo to start..."
           sleep 30
 
           for i in $(seq 1 12); do
@@ -140,7 +141,7 @@ jobs:
               "http://${{ env.INSTANCE_IP }}:8080/login?next=/" || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ DefectDojo is accessible! (HTTP $HTTP_CODE)"
+              echo "DefectDojo is accessible - HTTP $HTTP_CODE"
               break
             else
               echo "  Attempt $i/12 - HTTP $HTTP_CODE - retrying in 15s..."
@@ -155,10 +156,10 @@ jobs:
           if [ -n "${{ env.INSTANCE_NAME }}" ]; then
             gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
               --zone=${{ env.GCP_ZONE }} \
-              --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
-            echo "✅ Temporary SSH key removed from VM"
+              --keys="ssh-keys" || echo "Could not remove SSH key metadata"
+            echo "Temporary SSH key removed from VM"
           else
-            echo "⚠️ INSTANCE_NAME not set, skipping cleanup"
+            echo "INSTANCE_NAME not set, skipping cleanup"
           fi
 
       # ── Summary ─────────────────────────────────────────────────────────────
@@ -166,10 +167,10 @@ jobs:
         if: success()
         run: |
           echo "=============================================="
-          echo "  ✅ Deployment Complete!"
+          echo "  DefectDojo Deployment Complete!"
           echo "=============================================="
-          echo "  🌐 DefectDojo: http://${{ env.INSTANCE_IP }}:8080"
-          echo "  👤 Username:   admin"
-          echo "  🔑 Password:   (DD_ADMIN_PASSWORD secret)"
-          echo "  📊 SSH:        ssh ubuntu@${{ env.INSTANCE_IP }}"
+          echo "  URL:      http://${{ env.INSTANCE_IP }}:8080"
+          echo "  Username: admin"
+          echo "  Password: (DD_ADMIN_PASSWORD secret)"
+          echo "  SSH:      ssh ubuntu@${{ env.INSTANCE_IP }}"
           echo "=============================================="
