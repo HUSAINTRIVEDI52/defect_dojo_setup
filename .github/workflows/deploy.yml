@@ -111,8 +111,7 @@ jobs:
 
       - name: Copy Ansible files to VM
         run: |
-          tar -czf ansible.tar.gz ../ansible/
-
+          tar -czf ansible.tar.gz $GITHUB_WORKSPACE/ansible
           scp -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             ansible.tar.gz \
