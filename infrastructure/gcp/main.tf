@@ -7,12 +7,6 @@ terraform {
       version = "~> 5.0"
     }
   }
-
-  backend "gcs" {
-    # Values passed via -backend-config in the pipeline:
-    # bucket = "<project-id>-tfstate"
-    # prefix = "terraform/state"
-  }
 }
 
 provider "google" {
@@ -103,7 +97,7 @@ resource "google_compute_instance" "defectdojo" {
   boot_disk {
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2204-lts"
-      size  = 50   # GB — DefectDojo needs ~20GB minimum
+      size  = 50
       type  = "pd-ssd"
     }
   }
@@ -116,7 +110,6 @@ resource "google_compute_instance" "defectdojo" {
     }
   }
 
-  # Startup script — just prepares the VM, Ansible does the real work
   metadata_startup_script = <<-EOF
     #!/bin/bash
     apt-get update -qq
@@ -125,11 +118,9 @@ resource "google_compute_instance" "defectdojo" {
   EOF
 
   service_account {
-    email  = var.service_account_email
     scopes = ["cloud-platform"]
   }
 
-  # Allow stopping for updates
   allow_stopping_for_update = true
 
   labels = {
