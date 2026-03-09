@@ -1,0 +1,358 @@
+---
+- name: Install DefectDojo
+  hosts: all
+  become: yes
+  vars:
+    defectdojo_port: "{{ defectdojo_port | default('8080') }}"
+    
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+        state: present
+
+    - name: Add Docker GPG key
+      shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+
+    - name: Add Docker repository
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Start Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Create swap file (8GB)
+      shell: |
+        if [ ! -f /swapfile ]; then
+          fallocate -l 8G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+
+    - name: Tune swap settings
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { key: 'vm.swappiness', value: '10' }
+        - { key: 'vm.vfs_cache_pressure', value: '50' }
+
+    - name: Create DefectDojo directory
+      file:
+        path: /opt/defectdojo
+        state: directory
+        mode: '0755'
+
+    - name: Create docker-compose.yml
+      copy:
+        dest: /opt/defectdojo/docker-compose.yml
+        content: |
+          services:
+            database:
+              image: postgres:15-alpine
+              container_name: defectdojo-db
+              environment:
+                POSTGRES_USER: postgres
+                POSTGRES_PASSWORD: {{ db_password }}
+                POSTGRES_DB: defectdojo
+              volumes:
+                - db_data:/var/lib/postgresql/data
+              networks:
+                - dojo-network
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U postgres"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            redis:
+              image: redis:7-alpine
+              container_name: defectdojo-redis
+              networks:
+                - dojo-network
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            initializer:
+              image: defectdojo/defectdojo-django:latest
+              container_name: defectdojo-initializer
+              entrypoint: ["/entrypoint-initializer.sh"]
+              environment:
+                DD_DATABASE_ENGINE: django.db.backends.postgresql
+                DD_DATABASE_HOST: database
+                DD_DATABASE_PORT: "5432"
+                DD_DATABASE_NAME: defectdojo
+                DD_DATABASE_USER: postgres
+                DD_DATABASE_PASSWORD: {{ db_password }}
+                DD_SECRET_KEY: {{ secret_key }}
+                DD_ALLOWED_HOSTS: "*"
+                DD_INITIALIZE: "true"
+                DD_ADMIN_USER: admin
+                DD_ADMIN_PASSWORD: {{ admin_password }}
+                DD_ADMIN_FIRST_NAME: Admin
+                DD_ADMIN_LAST_NAME: User
+                DD_ADMIN_MAIL: admin@defectdojo.local
+                DD_CELERY_BROKER_URL: redis://redis:6379/0
+                CELERY_BROKER_URL: redis://redis:6379/0
+              depends_on:
+                database:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              volumes:
+                - media:/app/media
+                - static:/app/static
+              networks:
+                - dojo-network
+
+            uwsgi:
+              image: defectdojo/defectdojo-django:latest
+              container_name: defectdojo-uwsgi
+              entrypoint: ["/entrypoint-uwsgi.sh"]
+              environment:
+                DD_DATABASE_ENGINE: django.db.backends.postgresql
+                DD_DATABASE_HOST: database
+                DD_DATABASE_PORT: "5432"
+                DD_DATABASE_NAME: defectdojo
+                DD_DATABASE_USER: postgres
+                DD_DATABASE_PASSWORD: {{ db_password }}
+                DD_SECRET_KEY: {{ secret_key }}
+                DD_ALLOWED_HOSTS: "*"
+                DD_CELERY_BROKER_URL: redis://redis:6379/0
+                CELERY_BROKER_URL: redis://redis:6379/0
+                DD_SESSION_COOKIE_SECURE: "False"
+                DD_CSRF_COOKIE_SECURE: "False"
+                DD_UWSGI_MODE: http
+                DD_UWSGI_ENDPOINT: "0.0.0.0:{{ defectdojo_port }}"
+                DD_UWSGI_NUM_OF_PROCESSES: "2"
+                DD_UWSGI_NUM_OF_THREADS: "2"
+              ports:
+                - "{{ defectdojo_port }}:{{ defectdojo_port }}"
+              volumes:
+                - media:/app/media
+                - static:/app/static
+              networks:
+                - dojo-network
+              depends_on:
+                database:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              restart: unless-stopped
+
+            celery_worker:
+              image: defectdojo/defectdojo-django:latest
+              container_name: defectdojo-celery-worker
+              entrypoint: ["/entrypoint-celery-worker.sh"]
+              environment:
+                DD_DATABASE_ENGINE: django.db.backends.postgresql
+                DD_DATABASE_HOST: database
+                DD_DATABASE_PORT: "5432"
+                DD_DATABASE_NAME: defectdojo
+                DD_DATABASE_USER: postgres
+                DD_DATABASE_PASSWORD: {{ db_password }}
+                DD_SECRET_KEY: {{ secret_key }}
+                DD_ALLOWED_HOSTS: "*"
+                DD_CELERY_BROKER_URL: redis://redis:6379/0
+                CELERY_BROKER_URL: redis://redis:6379/0
+                DD_CELERY_LOG_LEVEL: INFO
+                DD_CELERY_WORKER_POOL_TYPE: solo
+              volumes:
+                - media:/app/media
+              networks:
+                - dojo-network
+              depends_on:
+                database:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              restart: unless-stopped
+
+            celery_beat:
+              image: defectdojo/defectdojo-django:latest
+              container_name: defectdojo-celery-beat
+              entrypoint: ["/entrypoint-celery-beat.sh"]
+              environment:
+                DD_DATABASE_ENGINE: django.db.backends.postgresql
+                DD_DATABASE_HOST: database
+                DD_DATABASE_PORT: "5432"
+                DD_DATABASE_NAME: defectdojo
+                DD_DATABASE_USER: postgres
+                DD_DATABASE_PASSWORD: {{ db_password }}
+                DD_SECRET_KEY: {{ secret_key }}
+                DD_ALLOWED_HOSTS: "*"
+                DD_CELERY_BROKER_URL: redis://redis:6379/0
+                CELERY_BROKER_URL: redis://redis:6379/0
+              networks:
+                - dojo-network
+              depends_on:
+                database:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              restart: unless-stopped
+
+          networks:
+            dojo-network:
+              name: defectdojo-network
+              driver: bridge
+
+          volumes:
+            db_data:
+            media:
+            static:
+
+    - name: Pull Docker images
+      shell: docker compose pull
+      args:
+        chdir: /opt/defectdojo
+
+    - name: Stop existing containers
+      shell: docker compose down -v
+      args:
+        chdir: /opt/defectdojo
+      ignore_errors: yes
+
+    - name: Start database and redis
+      shell: docker compose up -d database redis
+      args:
+        chdir: /opt/defectdojo
+
+    - name: Wait for database
+      shell: docker exec defectdojo-db pg_isready -U postgres
+      register: db_ready
+      until: db_ready.rc == 0
+      retries: 30
+      delay: 5
+
+    - name: Run initializer
+      shell: docker compose up initializer
+      args:
+        chdir: /opt/defectdojo
+
+    - name: Start DefectDojo services
+      shell: docker compose up -d uwsgi celery_worker celery_beat
+      args:
+        chdir: /opt/defectdojo
+
+    - name: Wait for DefectDojo to be ready
+      uri:
+        url: "http://127.0.0.1:{{ defectdojo_port }}/login"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 60
+      delay: 10
+
+    - name: Create systemd service
+      copy:
+        dest: /etc/systemd/system/defectdojo.service
+        content: |
+          [Unit]
+          Description=DefectDojo
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory=/opt/defectdojo
+          ExecStart=/usr/bin/docker compose up -d
+          ExecStop=/usr/bin/docker compose down
+          TimeoutStartSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable DefectDojo service
+      systemd:
+        name: defectdojo
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Create health check script
+      copy:
+        dest: /opt/defectdojo/healthcheck.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "=== DefectDojo Health Check ==="
+          echo ""
+          echo "Containers:"
+          docker compose ps
+          echo ""
+          echo "Database:"
+          docker exec defectdojo-db pg_isready -U postgres
+          echo ""
+          echo "Redis:"
+          docker exec defectdojo-redis redis-cli ping
+          echo ""
+          echo "Web Interface:"
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:{{ defectdojo_port }}/login
+
+    - name: Create backup script
+      copy:
+        dest: /opt/defectdojo/backup.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          BACKUP_DIR="/opt/defectdojo/backups"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          mkdir -p $BACKUP_DIR
+          docker exec defectdojo-db pg_dump -U postgres defectdojo > $BACKUP_DIR/backup_$TIMESTAMP.sql
+          echo "Backup created: $BACKUP_DIR/backup_$TIMESTAMP.sql"
+
+    - name: Print completion message
+      debug:
+        msg:
+          - "=============================================="
+          - "✅ DefectDojo Installation Complete!"
+          - "=============================================="
+          - "URL: http://{{ ansible_host }}:{{ defectdojo_port }}"
+          - "Username: admin"
+          - "Password: {{ admin_password }}"
+          - "=============================================="

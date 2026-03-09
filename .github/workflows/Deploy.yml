@@ -1,0 +1,172 @@
+name: Deploy DefectDojo (Manual Instance)
+
+# This workflow assumes you've manually created the GCP instance
+# It only runs Ansible to install DefectDojo
+
+on:
+  push:
+    branches:
+      - Infra-Pipeline
+  workflow_dispatch:
+
+env:
+  DEFECTDOJO_PORT: "8080"  # Change if you want different port
+
+jobs:
+  deploy:
+    name: Deploy DefectDojo on Existing Instance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ansible
+
+      - name: Create SSH private key file
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Test SSH connection
+        run: |
+          echo "Testing SSH connection to ${{ secrets.INSTANCE_IP }}..."
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            ubuntu@${{ secrets.INSTANCE_IP }} \
+            "echo '✅ SSH connection successful' && uname -a"
+
+      - name: Create Ansible inventory
+        run: |
+          cat > /tmp/inventory.ini << EOF
+          [defectdojo]
+          ${{ secrets.INSTANCE_IP }} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/deploy_key ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+          
+          echo "Inventory created:"
+          cat /tmp/inventory.ini
+
+      - name: Run Ansible Playbook
+        run: |
+          ansible-playbook \
+            -i /tmp/inventory.ini \
+            ansible/site.yml \
+            -e "db_password=${{ secrets.DB_PASSWORD }}" \
+            -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
+            -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
+            -e "defectdojo_port=${{ env.DEFECTDOJO_PORT }}" \
+            -v
+
+      - name: Verify DefectDojo is accessible
+        run: |
+          echo "⏳ Verifying DefectDojo accessibility..."
+          sleep 10
+          
+          for i in $(seq 1 10); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}/login?next=/" || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ DefectDojo is accessible! (HTTP $HTTP_CODE)"
+              break
+            else
+              echo "  Attempt $i/10 - HTTP $HTTP_CODE - retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+      - name: Print access details
+        run: |
+          echo ""
+          echo "=============================================="
+          echo "  ✅ DefectDojo Deployment Complete!"
+          echo "=============================================="
+          echo ""
+          echo "  🌐 Access URL:"
+          echo "     http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}"
+          echo ""
+          echo "  👤 Username: admin"
+          echo "  🔑 Password: (your DD_ADMIN_PASSWORD secret)"
+          echo ""
+          echo "  📊 SSH Access:"
+          echo "     ssh ubuntu@${{ secrets.INSTANCE_IP }}"
+          echo ""
+          echo "=============================================="
+          echo ""
+          echo "Next steps:"
+          echo "1. Access DefectDojo at the URL above"
+          echo "2. Login with admin credentials"
+          echo "3. Start your first engagement!"
+          echo ""
+          echo "Useful commands on the server:"
+          echo "  cd /opt/defectdojo"
+          echo "  ./healthcheck.sh      # Check service status"
+          echo "  ./backup.sh           # Create backup"
+          echo "  docker compose ps     # View containers"
+          echo "  docker logs dojo-uwsgi --tail 50  # View logs"
+          echo "=============================================="
+
+      - name: Save deployment info
+        run: |
+          cat > deployment-info.txt << EOF
+          ════════════════════════════════════════════════════════
+                    DefectDojo Deployment Information
+          ════════════════════════════════════════════════════════
+          
+          Deployment Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Instance IP: ${{ secrets.INSTANCE_IP }}
+          DefectDojo URL: http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}
+          
+          ────────────────────────────────────────────────────────
+          Access Credentials
+          ────────────────────────────────────────────────────────
+          Username: admin
+          Password: <stored in DD_ADMIN_PASSWORD secret>
+          
+          ────────────────────────────────────────────────────────
+          Services Running
+          ────────────────────────────────────────────────────────
+          • DefectDojo Web:    http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}
+          • PostgreSQL:        Internal (port 5432)
+          • Redis:             Internal (port 6379)
+          • Celery Worker:     Background tasks
+          • Celery Beat:       Scheduled tasks
+          
+          ────────────────────────────────────────────────────────
+          Server Management
+          ────────────────────────────────────────────────────────
+          SSH: ssh ubuntu@${{ secrets.INSTANCE_IP }}
+          
+          Useful Commands:
+            cd /opt/defectdojo
+            ./healthcheck.sh              # Check all services
+            ./backup.sh                   # Backup database
+            docker compose ps             # Container status
+            docker compose logs -f        # Follow all logs
+            docker logs dojo-uwsgi        # Web server logs
+            docker logs defectdojo-db     # Database logs
+          
+          ────────────────────────────────────────────────────────
+          Troubleshooting
+          ────────────────────────────────────────────────────────
+          If DefectDojo is not accessible:
+            1. Check firewall: Port ${{ env.DEFECTDOJO_PORT }} must be open
+            2. Check containers: docker compose ps
+            3. Check logs: docker logs dojo-uwsgi --tail 50
+            4. Run health check: ./healthcheck.sh
+          
+          ════════════════════════════════════════════════════════
+          EOF
+          
+          cat deployment-info.txt
+
+      - name: Upload deployment info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: deployment-info.txt
+          retention-days: 30
