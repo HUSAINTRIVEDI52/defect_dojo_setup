@@ -37,20 +37,17 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Apply
-        working-directory: infrastructure/gcp
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ secrets.GCP_PROJECT_ID }}-tfstate" \
-            -backend-config="prefix=terraform/state"
+         working-directory: infrastructure/gcp
+         run: |
+           terraform init
 
-          terraform apply -auto-approve \
-            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
-            -var="region=${{ env.GCP_REGION }}" \
-            -var="zone=${{ env.GCP_ZONE }}"
+           terraform apply -auto-approve \
+              -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+              -var="region=${{ env.GCP_REGION }}" \
+              -var="zone=${{ env.GCP_ZONE }}"
 
-          # Capture outputs
-          echo "INSTANCE_IP=$(terraform output -raw instance_ip)"         >> $GITHUB_ENV
-          echo "INSTANCE_NAME=$(terraform output -raw instance_name)"     >> $GITHUB_ENV
+            echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
+            echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
 
       # ── SSH Key (temp, generated fresh every run) ───────────────────────────
       - name: Generate temporary SSH key
@@ -159,10 +156,14 @@ jobs:
       - name: Remove temporary SSH key from VM
         if: always()
         run: |
-          gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
-            --zone=${{ env.GCP_ZONE }} \
-            --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
-          echo "✅ Temporary SSH key removed from VM"
+           if [ -n "${{ env.INSTANCE_NAME }}" ]; then
+               gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
+                 --zone=${{ env.GCP_ZONE }} \
+                  --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
+                 echo "✅ Temporary SSH key removed from VM"
+               else
+                 echo "⚠️ INSTANCE_NAME not set (Terraform likely failed), skipping cleanup"
+                fi  
 
       # ── Summary ─────────────────────────────────────────────────────────────
       - name: Print deployment summary
