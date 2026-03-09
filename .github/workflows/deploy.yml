@@ -122,26 +122,41 @@ jobs:
 
       - name: Run Ansible playbook on VM
         run: |
-          ssh -i ~/.ssh/deploy_key \
+           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
-            ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
-              set -e
-
-              echo "Installing dependencies..."
-              sudo apt-get update -qq
-              sudo apt-get install -y ansible docker.io docker-compose-v2
-
-              echo "Extracting Ansible files..."
-              tar -xzf ~/ansible.tar.gz
-
-              echo "Running Ansible playbook..."
-              cd ~/ansible
-              sudo ansible-playbook -i localhost, -c local site.yml \
-                -e "db_password=${{ secrets.DB_PASSWORD }}" \
-                -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
-                -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}"
-
-              echo "Ansible completed"
+            ubuntu@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
+            set -e
+            
+            echo "Waiting for cloud-init and apt to complete..."
+            # Wait for cloud-init to finish
+            cloud-init status --wait || true
+            
+            # Wait for apt locks to be released
+            while sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ; do
+              echo "Waiting for apt lock to be released..."
+              sleep 5
+            done
+            
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ; do
+              echo "Waiting for dpkg lock to be released..."
+              sleep 5
+            done
+            
+            echo "Installing dependencies..."
+            sudo apt-get update -qq
+            sudo apt-get install -y ansible docker.io docker-compose-v2
+            
+            echo "Extracting Ansible files..."
+            tar -xzf ~/ansible.tar.gz
+            
+            echo "Running Ansible playbook..."
+            cd ~/ansible
+            sudo ansible-playbook -i localhost, -c local site.yml \
+              -e "db_password=${{ secrets.DB_PASSWORD }}" \
+              -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
+              -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}"
+            
+            echo "Ansible completed"
           ENDSSH
 
       - name: Verify DefectDojo is accessible
