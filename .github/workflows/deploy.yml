@@ -110,8 +110,9 @@ jobs:
           done
 
       - name: Copy Ansible files to VM
+        working-directory: ${{ github.workspace }}  # Add this line
         run: |
-          tar -czf ansible.tar.gz $GITHUB_WORKSPACE/ansible
+          tar -czf ansible.tar.gz ansible/
           scp -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             ansible.tar.gz \
