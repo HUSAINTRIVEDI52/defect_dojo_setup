@@ -1,4 +1,6 @@
 ---
+# Deploy DefectDojo with configurable port
+
 - name: Create deployment directory
   file:
     path: /opt/defectdojo
@@ -8,19 +10,15 @@
     group: root
   become: yes
 
-- name: Deploy docker-compose.yml
-  copy:
-    src: docker-compose.yml
+- name: Set default DefectDojo port if not provided
+  set_fact:
+    defectdojo_port: "{{ defectdojo_port | default('8080') }}"
+
+- name: Deploy docker-compose.yml template
+  template:
+    src: docker-compose.yml.j2
     dest: /opt/defectdojo/docker-compose.yml
     mode: '0644'
-    force: yes
-  become: yes
-
-- name: Deploy init-db.sh
-  copy:
-    src: init-db.sh
-    dest: /opt/defectdojo/init-db.sh
-    mode: '0755'
     force: yes
   become: yes
 
@@ -29,10 +27,24 @@
     dest: /opt/defectdojo/.env
     mode: '0600'
     content: |
+      # Database Configuration
       DB_USER=postgres
       DB_PASSWORD={{ db_password }}
+      
+      # DefectDojo Configuration
       DD_ADMIN_PASSWORD={{ dd_admin_password }}
       DD_SECRET_KEY={{ dd_secret_key }}
+      DD_PORT={{ defectdojo_port }}
+      
+      # Debug (set to False in production)
+      DD_DEBUG=False
+  become: yes
+
+- name: Ensure Docker daemon is running
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
   become: yes
 
 - name: Pull latest DefectDojo images
@@ -40,6 +52,10 @@
   args:
     chdir: /opt/defectdojo
   become: yes
+  register: pull_result
+  retries: 3
+  delay: 10
+  until: pull_result.rc == 0
 
 - name: Tear down any previous containers and volumes (clean slate)
   shell: docker compose down -v --remove-orphans
@@ -58,15 +74,28 @@
   shell: docker exec defectdojo-db pg_isready -U postgres
   register: pg_ready
   until: pg_ready.rc == 0
-  retries: 20
+  retries: 30
   delay: 5
   become: yes
 
-- name: Run DefectDojo initializer
+- name: Wait for Redis to be ready
+  shell: docker exec dojo-redis redis-cli ping
+  register: redis_ready
+  until: redis_ready.stdout == "PONG"
+  retries: 20
+  delay: 3
+  become: yes
+
+- name: Run DefectDojo initializer (database migrations + superuser creation)
   shell: docker compose up initializer
   args:
     chdir: /opt/defectdojo
   become: yes
+  register: initializer_result
+
+- name: Display initializer output
+  debug:
+    var: initializer_result.stdout_lines
 
 - name: Start remaining DefectDojo services
   shell: docker compose up -d uwsgi celery_worker celery_beat
@@ -74,17 +103,148 @@
     chdir: /opt/defectdojo
   become: yes
 
-- name: Wait for DefectDojo to be accessible on port 8080
+- name: Wait for DefectDojo to be accessible on port {{ defectdojo_port }}
   uri:
-    url: "http://127.0.0.1:8080/login?next=/"
+    url: "http://127.0.0.1:{{ defectdojo_port }}/login?next=/"
     method: GET
     status_code: 200
   register: dojo_check
   until: dojo_check.status == 200
-  retries: 40
-  delay: 15
+  retries: 60
+  delay: 10
   become: yes
+
+- name: Get container status
+  shell: docker compose ps
+  args:
+    chdir: /opt/defectdojo
+  register: container_status
+  become: yes
+
+- name: Display container status
+  debug:
+    var: container_status.stdout_lines
+
+- name: Check DefectDojo logs for any errors
+  shell: docker logs dojo-uwsgi --tail 50
+  register: uwsgi_logs
+  become: yes
+  ignore_errors: yes
+
+- name: Display recent uwsgi logs
+  debug:
+    var: uwsgi_logs.stdout_lines
 
 - name: Print DefectDojo access info
   debug:
-    msg: "DefectDojo is UP at http://{{ ansible_host }}:8080 — Login: admin / {{ dd_admin_password }}"
+    msg: 
+      - "=============================================="
+      - "  ✅ DefectDojo is UP and RUNNING!"
+      - "=============================================="
+      - "  🌐 URL: http://{{ ansible_host }}:{{ defectdojo_port }}"
+      - "  👤 Username: admin"
+      - "  🔑 Password: {{ dd_admin_password }}"
+      - "=============================================="
+      - ""
+      - "Services Status:"
+      - "  - PostgreSQL: Running on port 5432 (internal)"
+      - "  - Redis: Running on port 6379 (internal)"
+      - "  - DefectDojo Web: Running on port {{ defectdojo_port }}"
+      - "  - Celery Worker: Running"
+      - "  - Celery Beat: Running"
+      - "=============================================="
+
+- name: Create healthcheck script
+  copy:
+    dest: /opt/defectdojo/healthcheck.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # DefectDojo Health Check Script
+      
+      echo "Checking DefectDojo services..."
+      echo ""
+      
+      # Check containers
+      echo "=== Container Status ==="
+      docker compose ps
+      echo ""
+      
+      # Check database
+      echo "=== Database Status ==="
+      docker exec defectdojo-db pg_isready -U postgres
+      echo ""
+      
+      # Check Redis
+      echo "=== Redis Status ==="
+      docker exec dojo-redis redis-cli ping
+      echo ""
+      
+      # Check web interface
+      echo "=== Web Interface Status ==="
+      curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://localhost:{{ defectdojo_port }}/login?next=/
+      echo ""
+      
+      # Check logs for errors
+      echo "=== Recent Errors (if any) ==="
+      docker logs dojo-uwsgi --tail 20 2>&1 | grep -i error || echo "No errors found"
+      echo ""
+      
+      echo "Health check complete!"
+  become: yes
+
+- name: Create backup script
+  copy:
+    dest: /opt/defectdojo/backup.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # DefectDojo Backup Script
+      
+      BACKUP_DIR="/opt/defectdojo/backups"
+      TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+      
+      mkdir -p $BACKUP_DIR
+      
+      echo "Starting DefectDojo backup at $TIMESTAMP..."
+      
+      # Backup database
+      docker exec defectdojo-db pg_dump -U postgres defectdojo > $BACKUP_DIR/defectdojo_db_$TIMESTAMP.sql
+      
+      # Backup media files
+      docker cp dojo-uwsgi:/app/media $BACKUP_DIR/media_$TIMESTAMP
+      
+      # Compress backups
+      cd $BACKUP_DIR
+      tar -czf backup_$TIMESTAMP.tar.gz defectdojo_db_$TIMESTAMP.sql media_$TIMESTAMP
+      rm -rf defectdojo_db_$TIMESTAMP.sql media_$TIMESTAMP
+      
+      # Keep only last 7 backups
+      ls -t backup_*.tar.gz | tail -n +8 | xargs -r rm
+      
+      echo "Backup complete: $BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
+  become: yes
+
+- name: Ensure DefectDojo starts on boot
+  shell: |
+    cat > /etc/systemd/system/defectdojo.service << 'EOF'
+    [Unit]
+    Description=DefectDojo Docker Compose Application
+    Requires=docker.service
+    After=docker.service
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    WorkingDirectory=/opt/defectdojo
+    ExecStart=/usr/bin/docker compose up -d
+    ExecStop=/usr/bin/docker compose down
+    TimeoutStartSec=0
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable defectdojo.service
+  become: yes

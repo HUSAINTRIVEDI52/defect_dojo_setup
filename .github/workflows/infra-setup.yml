@@ -10,6 +10,7 @@ env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_REGION: us-central1
   GCP_ZONE: us-central1-a
+  DEFECTDOJO_PORT: "8080"  # Configurable port
 
 jobs:
   provision:
@@ -26,6 +27,21 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create Terraform state bucket if it doesn't exist
+        run: |
+          BUCKET_NAME="${{ env.GCP_PROJECT_ID }}-tfstate"
+          if ! gsutil ls -b gs://${BUCKET_NAME} &>/dev/null; then
+            echo "Creating Terraform state bucket: ${BUCKET_NAME}"
+            gsutil mb -p ${{ env.GCP_PROJECT_ID }} -c STANDARD -l ${{ env.GCP_REGION }} gs://${BUCKET_NAME}/
+            gsutil versioning set on gs://${BUCKET_NAME}/
+            echo "✅ Bucket created successfully"
+          else
+            echo "✅ Bucket already exists"
+          fi
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -45,14 +61,20 @@ jobs:
             -backend-config="bucket=${{ env.GCP_PROJECT_ID }}-tfstate" \
             -backend-config="prefix=terraform/defectdojo"
 
-      - name: Terraform Apply
+      - name: Terraform Plan
         working-directory: infrastructure/gcp
         run: |
-          terraform apply -auto-approve \
+          terraform plan \
             -var="project_id=${{ env.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
             -var="zone=${{ env.GCP_ZONE }}" \
-            -var="ssh_pub_key=${{ env.TF_VAR_ssh_pub_key }}"
+            -var="ssh_pub_key=${{ env.TF_VAR_ssh_pub_key }}" \
+            -var="defectdojo_port=${{ env.DEFECTDOJO_PORT }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: infrastructure/gcp
+        run: terraform apply -auto-approve tfplan
 
       - name: Capture instance IP
         id: tf_output
@@ -102,7 +124,7 @@ jobs:
       - name: Wait for VM SSH to be ready
         run: |
           echo "⏳ Waiting for SSH on ${{ needs.provision.outputs.instance_ip }}..."
-          for i in $(seq 1 20); do
+          for i in $(seq 1 30); do
             if ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 \
@@ -110,9 +132,16 @@ jobs:
               echo "✅ SSH is ready"
               break
             fi
-            echo "  attempt $i/20 — retrying in 15s..."
+            echo "  attempt $i/30 — retrying in 15s..."
             sleep 15
           done
+
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            ubuntu@${{ needs.provision.outputs.instance_ip }} \
+            "echo '✅ SSH connection successful' && uname -a"
 
       - name: Create Ansible inventory
         run: |
@@ -129,7 +158,20 @@ jobs:
             -e "db_password=${{ secrets.DB_PASSWORD }}" \
             -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
             -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
+            -e "defectdojo_port=${{ env.DEFECTDOJO_PORT }}" \
             -v
+
+      - name: Verify DefectDojo is accessible
+        run: |
+          echo "⏳ Verifying DefectDojo accessibility..."
+          for i in $(seq 1 10); do
+            if curl -s -o /dev/null -w "%{http_code}" "http://${{ needs.provision.outputs.instance_ip }}:${{ env.DEFECTDOJO_PORT }}/login?next=/" | grep -q "200"; then
+              echo "✅ DefectDojo is accessible!"
+              break
+            fi
+            echo "  attempt $i/10 — retrying in 10s..."
+            sleep 10
+          done
 
       - name: Print access details
         run: |
@@ -137,7 +179,56 @@ jobs:
           echo "=============================================="
           echo "  ✅ DefectDojo Deployment Complete!"
           echo "=============================================="
-          echo "  🌐 URL:      http://${{ needs.provision.outputs.instance_ip }}:8080"
+          echo "  🌐 URL:      http://${{ needs.provision.outputs.instance_ip }}:${{ env.DEFECTDOJO_PORT }}"
           echo "  👤 Username: admin"
           echo "  🔑 Password: (your DD_ADMIN_PASSWORD secret)"
           echo "=============================================="
+          echo ""
+          echo "Next steps:"
+          echo "1. Access DefectDojo at the URL above"
+          echo "2. Login with admin credentials"
+          echo "3. Configure your first product/engagement"
+          echo "4. Integrate with your CI/CD pipelines"
+          echo "=============================================="
+
+      - name: Save deployment info
+        run: |
+          cat > deployment-info.txt << EOF
+          DefectDojo Deployment Information
+          ==================================
+          
+          Deployment Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Instance IP: ${{ needs.provision.outputs.instance_ip }}
+          DefectDojo URL: http://${{ needs.provision.outputs.instance_ip }}:${{ env.DEFECTDOJO_PORT }}
+          
+          GCP Details:
+          - Project: ${{ env.GCP_PROJECT_ID }}
+          - Region: ${{ env.GCP_REGION }}
+          - Zone: ${{ env.GCP_ZONE }}
+          
+          Access:
+          - Username: admin
+          - Password: <stored in GitHub Secrets>
+          
+          Services:
+          - DefectDojo: http://${{ needs.provision.outputs.instance_ip }}:${{ env.DEFECTDOJO_PORT }}
+          - PostgreSQL: Internal (port 5432)
+          - Redis: Internal (port 6379)
+          
+          SSH Access:
+          ssh -i <your-private-key> ubuntu@${{ needs.provision.outputs.instance_ip }}
+          
+          Docker Services:
+          - defectdojo-db (PostgreSQL)
+          - dojo-redis (Redis)
+          - dojo-uwsgi (Web Interface)
+          - dojo-celery-worker (Background Tasks)
+          - dojo-celery-beat (Scheduled Tasks)
+          EOF
+
+      - name: Upload deployment info
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: deployment-info.txt
+          retention-days: 30
