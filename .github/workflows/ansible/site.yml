@@ -1,0 +1,56 @@
+---
+- name: Install DefectDojo
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    db_password: "{{ db_password }}"
+    dd_admin_password: "{{ dd_admin_password }}"
+    dd_secret_key: "{{ dd_secret_key }}"
+    defectdojo_dir: /opt/defectdojo
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - git
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Clone DefectDojo repository
+      git:
+        repo: https://github.com/DefectDojo/django-DefectDojo.git
+        dest: "{{ defectdojo_dir }}"
+        version: master
+        force: yes
+
+    - name: Create .env file
+      copy:
+        dest: "{{ defectdojo_dir }}/.env"
+        content: |
+          DD_DATABASE_PASSWORD={{ db_password }}
+          DD_ADMIN_PASSWORD={{ dd_admin_password }}
+          DD_SECRET_KEY={{ dd_secret_key }}
+          DD_ALLOWED_HOSTS=*
+          DD_DEBUG=False
+
+    - name: Start DefectDojo with docker compose
+      command: docker compose up -d
+      args:
+        chdir: "{{ defectdojo_dir }}"
+
+    - name: Wait for DefectDojo to be ready
+      wait_for:
+        port: 8080
+        host: localhost
+        timeout: 300
