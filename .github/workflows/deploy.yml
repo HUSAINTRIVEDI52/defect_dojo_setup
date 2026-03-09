@@ -32,46 +32,40 @@ jobs:
         with:
           terraform_version: 1.6.0
           terraform_wrapper: false
+      - name: Restore Terraform state
+        run: |
+          mkdir -p infrastructure/gcp
+          gh api repos/${{ github.repository }}/contents/terraform.tfstate \
+            --jq '.content' | base64 -d > infrastructure/gcp/terraform.tfstate 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Terraform Init & Apply
         working-directory: infrastructure/gcp
         run: |
           terraform init
-
-          terraform import google_compute_network.defectdojo_vpc \
-            projects/${{ secrets.GCP_PROJECT_ID }}/global/networks/defectdojo-vpc 2>/dev/null || true
-
-          terraform import google_compute_address.defectdojo_ip \
-            projects/${{ secrets.GCP_PROJECT_ID }}/regions/us-central1/addresses/defectdojo-static-ip 2>/dev/null || true
-
-          terraform import google_compute_subnetwork.defectdojo_subnet \
-            projects/${{ secrets.GCP_PROJECT_ID }}/regions/us-central1/subnetworks/defectdojo-subnet 2>/dev/null || true
-
-          terraform import google_compute_firewall.allow_ssh \
-            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-ssh 2>/dev/null || true
-
-          terraform import google_compute_firewall.allow_http \
-            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-http 2>/dev/null || true
-
-          terraform import google_compute_firewall.allow_internal \
-            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-internal 2>/dev/null || true
-
-          terraform import google_compute_instance.defectdojo \
-            projects/${{ secrets.GCP_PROJECT_ID }}/zones/us-central1-a/instances/defectdojo-vm 2>/dev/null || true
-
           terraform apply -auto-approve \
             -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
             -var="zone=${{ env.GCP_ZONE }}" \
-            -var="machine_type=e2-standard-2"
-
+            -var="machine_type=e2-micro"
           echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
           echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
 
-      - name: Generate temporary SSH key
+      - name: Save Terraform state
+        if: always()
         run: |
-          ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
-          echo "SSH key generated"
+          gh api repos/${{ github.repository }}/contents/terraform.tfstate \
+            -X PUT \
+            --field message="Update terraform state" \
+            --field content="$(base64 -w0 infrastructure/gcp/terraform.tfstate)" \
+            --field sha="$(gh api repos/${{ github.repository }}/contents/terraform.tfstate --jq '.sha' 2>/dev/null || echo '')" 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: Generate temporary SSH key
+              run: |
+                ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
+                echo "SSH key generated"
 
       - name: Push SSH public key to VM via gcloud
         run: |
