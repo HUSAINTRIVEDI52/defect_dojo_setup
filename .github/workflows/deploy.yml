@@ -32,6 +32,7 @@ jobs:
         with:
           terraform_version: 1.6.0
           terraform_wrapper: false
+
       - name: Restore Terraform state
         run: |
           mkdir -p infrastructure/gcp
@@ -62,10 +63,11 @@ jobs:
             --field sha="$(gh api repos/${{ github.repository }}/contents/terraform.tfstate --jq '.sha' 2>/dev/null || echo '')" 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-            - name: Generate temporary SSH key
-              run: |
-                ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
-                echo "SSH key generated"
+
+      - name: Generate temporary SSH key
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
+          echo "SSH key generated"
 
       - name: Push SSH public key to VM via gcloud
         run: |
@@ -163,9 +165,9 @@ jobs:
       - name: Remove temporary SSH key from VM
         if: always()
         run: |
-          gcloud compute instances remove-metadata defectdojo-vm \
-           --zone us-central1-a \
-           --keys ssh-keys || true
+          gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
+            --zone=${{ env.GCP_ZONE }} \
+            --keys=ssh-keys || true
 
       - name: Print deployment summary
         if: success()
