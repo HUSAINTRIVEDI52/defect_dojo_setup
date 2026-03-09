@@ -5,27 +5,31 @@
   become: true
 
   vars:
-    db_password: "{{ db_password }}"
-    dd_admin_password: "{{ dd_admin_password }}"
-    dd_secret_key: "{{ dd_secret_key }}"
+    db_password: "{{ db_password | default('defectdojo') }}"
+    dd_admin_password: "{{ dd_admin_password | default('admin') }}"
+    dd_secret_key: "{{ dd_secret_key | default('hhZCp@D28z!n@NED*yB!ROMt+WzsY*Vy') }}"
     defectdojo_dir: /opt/defectdojo
 
   tasks:
     - name: Install required packages
       apt:
         name:
-          - docker.io
-          - docker-compose-v2
           - git
           - curl
         state: present
         update_cache: yes
 
-    - name: Start and enable Docker
+    - name: Ensure Docker is running
       systemd:
         name: docker
         state: started
         enabled: yes
+
+    - name: Remove existing DefectDojo directory if exists
+      file:
+        path: "{{ defectdojo_dir }}"
+        state: absent
+      when: false  # Set to true to force clean install
 
     - name: Clone DefectDojo repository
       git:
@@ -33,24 +37,116 @@
         dest: "{{ defectdojo_dir }}"
         version: master
         force: yes
+        depth: 1
 
-    - name: Create .env file
+    - name: Check if .env.prod file exists
+      stat:
+        path: "{{ defectdojo_dir }}/.env.prod"
+      register: env_file
+
+    - name: Copy template .env file
       copy:
-        dest: "{{ defectdojo_dir }}/.env"
-        content: |
-          DD_DATABASE_PASSWORD={{ db_password }}
-          DD_ADMIN_PASSWORD={{ dd_admin_password }}
-          DD_SECRET_KEY={{ dd_secret_key }}
-          DD_ALLOWED_HOSTS=*
-          DD_DEBUG=False
+        src: "{{ defectdojo_dir }}/.env.prod.template"
+        dest: "{{ defectdojo_dir }}/.env.prod"
+        remote_src: yes
+      when: not env_file.stat.exists
 
-    - name: Start DefectDojo with docker compose
-      command: docker compose up -d
+    - name: Configure DefectDojo environment variables
+      lineinfile:
+        path: "{{ defectdojo_dir }}/.env.prod"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        create: yes
+      loop:
+        - { regexp: '^DD_DATABASE_PASSWORD=', line: 'DD_DATABASE_PASSWORD={{ db_password }}' }
+        - { regexp: '^DD_ADMIN_PASSWORD=', line: 'DD_ADMIN_PASSWORD={{ dd_admin_password }}' }
+        - { regexp: '^DD_SECRET_KEY=', line: 'DD_SECRET_KEY={{ dd_secret_key }}' }
+        - { regexp: '^DD_ALLOWED_HOSTS=', line: 'DD_ALLOWED_HOSTS=*' }
+        - { regexp: '^DD_DEBUG=', line: 'DD_DEBUG=False' }
+        - { regexp: '^DD_ADMIN_USER=', line: 'DD_ADMIN_USER=admin' }
+        - { regexp: '^DD_ADMIN_MAIL=', line: 'DD_ADMIN_MAIL=admin@defectdojo.local' }
+
+    - name: Pull Docker images (this may take several minutes)
+      command: docker compose pull
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      environment:
+        DD_DATABASE_PASSWORD: "{{ db_password }}"
+        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
+        DD_SECRET_KEY: "{{ dd_secret_key }}"
+
+    - name: Build and start DefectDojo (first time - may take 10-15 minutes)
+      command: docker compose up -d --build
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      environment:
+        DD_DATABASE_PASSWORD: "{{ db_password }}"
+        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
+        DD_SECRET_KEY: "{{ dd_secret_key }}"
+      async: 1800  # 30 minutes timeout
+      poll: 30
+
+    - name: Wait for MySQL container to be healthy
+      shell: |
+        for i in {1..60}; do
+          if docker compose ps mysql | grep -q "healthy"; then
+            echo "MySQL is healthy"
+            exit 0
+          fi
+          echo "Waiting for MySQL... attempt $i/60"
+          sleep 5
+        done
+        exit 1
       args:
         chdir: "{{ defectdojo_dir }}"
 
-    - name: Wait for DefectDojo to be ready
+    - name: Run database migrations
+      command: docker compose exec -T uwsgi python manage.py migrate
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      ignore_errors: yes
+
+    - name: Create superuser
+      shell: |
+        docker compose exec -T uwsgi python manage.py createsuperuser \
+          --noinput \
+          --username admin \
+          --email admin@defectdojo.local 2>&1 || echo "Superuser already exists"
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      environment:
+        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
+
+    - name: Initialize DefectDojo data
+      command: docker compose exec -T uwsgi python manage.py loaddata initial_data
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      ignore_errors: yes
+
+    - name: Wait for NGINX/web interface
       wait_for:
-        port: 8080
         host: localhost
+        port: 8080
         timeout: 300
+        delay: 10
+
+    - name: Get DefectDojo status
+      command: docker compose ps
+      args:
+        chdir: "{{ defectdojo_dir }}"
+      register: compose_status
+
+    - name: Display running containers
+      debug:
+        msg: "{{ compose_status.stdout_lines }}"
+
+    - name: Show DefectDojo access information
+      debug:
+        msg:
+          - "========================================"
+          - "DefectDojo is now running!"
+          - "========================================"
+          - "Access URL: http://{{ ansible_default_ipv4.address }}:8080"
+          - "Username: admin"
+          - "Password: {{ dd_admin_password }}"
+          - "========================================"
