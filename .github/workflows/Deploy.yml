@@ -20,7 +20,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+      - name: Debug SSH key
+        run: |
+          echo "Key fingerprint:"
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | ssh-keygen -l -f /dev/stdin || echo "Invalid key format"
+          echo "VM User: ${{ secrets.VM_USER }}"
+          echo "IP starts with: $(echo '${{ secrets.INSTANCE_IP }}' | cut -c1-3)..."
       - name: Install Ansible
         run: |
           sudo apt-get update -qq
