@@ -38,15 +38,14 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             -o ConnectTimeout=10 \
-            ubuntu@${{ secrets.INSTANCE_IP }} \
+            ${{ secrets.VM_USER }}@${{ secrets.INSTANCE_IP }} \
             "echo '✅ SSH connection successful' && uname -a"
 
-      - name: Create Ansible inventory
+      - name: Create Ansible
         run: |
           cat > /tmp/inventory.ini << EOF
           [defectdojo]
-          ${{ secrets.INSTANCE_IP }} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/deploy_key ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-          EOF
+          ${{ secrets.INSTANCE_IP }} ansible_user=${{ secrets.VM_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key ansible_ssh_common_args='-o StrictHostKeyChecking=no'           EOF
           
           echo "Inventory created:"
           cat /tmp/inventory.ini
@@ -93,7 +92,7 @@ jobs:
           echo "  🔑 Password: (your DD_ADMIN_PASSWORD secret)"
           echo ""
           echo "  📊 SSH Access:"
-          echo "     ssh ubuntu@${{ secrets.INSTANCE_IP }}"
+          echo "     ssh ${{ secrets.VM_USER }}@${{ secrets.INSTANCE_IP }}
           echo ""
           echo "=============================================="
           echo ""
