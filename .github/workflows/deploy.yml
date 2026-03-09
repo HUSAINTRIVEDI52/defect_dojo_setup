@@ -36,14 +36,34 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Apply
-        working-directory: infrastructure/gcp
+         working-directory: infrastructure/gcp
         run: |
           terraform init
+
+          # Import existing resources if they already exist
+          terraform import google_compute_network.defectdojo_vpc \
+            projects/${{ secrets.GCP_PROJECT_ID }}/global/networks/defectdojo-vpc 2>/dev/null || true
+
+          terraform import google_compute_address.defectdojo_ip \
+            projects/${{ secrets.GCP_PROJECT_ID }}/regions/us-central1/addresses/defectdojo-static-ip 2>/dev/null || true
+
+          terraform import google_compute_subnetwork.defectdojo_subnet \
+            projects/${{ secrets.GCP_PROJECT_ID }}/regions/us-central1/subnetworks/defectdojo-subnet 2>/dev/null || true
+
+          terraform import google_compute_firewall.allow_ssh \
+            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-ssh 2>/dev/null || true
+
+          terraform import google_compute_firewall.allow_http \
+            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-http 2>/dev/null || true
+
+          terraform import google_compute_firewall.allow_internal \
+            projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-internal 2>/dev/null || true
 
           terraform apply -auto-approve \
             -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
-            -var="zone=${{ env.GCP_ZONE }}"
+            -var="zone=${{ env.GCP_ZONE }}" \
+            -var="machine_type=e2-standard-2"
 
           echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
           echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
