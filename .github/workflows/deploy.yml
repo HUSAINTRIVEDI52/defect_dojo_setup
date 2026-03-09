@@ -126,29 +126,26 @@ jobs:
             ubuntu@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
             set -e
             
-            echo "Waiting for system to be ready..."
-            sleep 45
+            echo "Waiting for cloud-init to complete..."
+            sudo cloud-init status --wait 2>/dev/null || echo "cloud-init not available, continuing..."
+            
+            echo "Waiting for unattended-upgrades to finish..."
+            # Wait for any existing apt/dpkg processes to finish
+            while sudo lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+                  sudo lsof /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+                  sudo lsof /var/lib/dpkg/lock >/dev/null 2>&1; do
+              echo "  Waiting for apt locks to be released..."
+              sleep 5
+            done
+            
+            # Double-check: wait a bit more and kill any remaining unattended-upgrade processes
+            sleep 10
+            sudo killall -9 unattended-upgrade apt-get 2>/dev/null || true
+            sleep 5
             
             echo "Installing dependencies..."
-            # Retry apt-get update until it succeeds
-            for i in {1..10}; do
-              if sudo apt-get update -qq; then
-                echo "apt-get update successful"
-                break
-              fi
-              echo "  apt-get update locked, retrying in 10s... ($i/10)"
-              sleep 10
-            done
-            
-            # Retry apt-get install until it succeeds
-            for i in {1..10}; do
-              if sudo apt-get install -y ansible docker.io docker-compose-v2; then
-                echo "apt-get install successful"
-                break
-              fi
-              echo "  apt-get install locked, retrying in 10s... ($i/10)"
-              sleep 10
-            done
+            sudo apt-get update -qq
+            sudo apt-get install -y ansible docker.io docker-compose-v2
             
             echo "Extracting Ansible files..."
             tar -xzf ~/ansible.tar.gz
