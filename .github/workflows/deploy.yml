@@ -122,7 +122,7 @@ jobs:
 
       - name: Run Ansible playbook on VM
         run: |
-           ssh -i ~/.ssh/deploy_key \
+          ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             ubuntu@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
             set -e
