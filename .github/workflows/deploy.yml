@@ -130,17 +130,25 @@ jobs:
             sleep 45
             
             echo "Installing dependencies..."
-            # Retry apt-get update until it succeeds (handles apt locks)
+            # Retry apt-get update until it succeeds
             for i in {1..10}; do
               if sudo apt-get update -qq; then
                 echo "apt-get update successful"
                 break
               fi
-              echo "  apt-get locked, retrying in 10s... ($i/10)"
+              echo "  apt-get update locked, retrying in 10s... ($i/10)"
               sleep 10
             done
             
-            sudo apt-get install -y ansible docker.io docker-compose-v2
+            # Retry apt-get install until it succeeds
+            for i in {1..10}; do
+              if sudo apt-get install -y ansible docker.io docker-compose-v2; then
+                echo "apt-get install successful"
+                break
+              fi
+              echo "  apt-get install locked, retrying in 10s... ($i/10)"
+              sleep 10
+            done
             
             echo "Extracting Ansible files..."
             tar -xzf ~/ansible.tar.gz
