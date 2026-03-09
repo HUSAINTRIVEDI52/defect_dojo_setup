@@ -1,7 +1,4 @@
-name: Deploy DefectDojo (Manual Instance)
-
-# This workflow assumes you've manually created the GCP instance
-# It only runs Ansible to install DefectDojo
+name: Infrastructure Setup (Permanent)
 
 on:
   push:
@@ -10,167 +7,172 @@ on:
   workflow_dispatch:
 
 env:
-  DEFECTDOJO_PORT: "8080"  # Change if you want different port
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  GCP_ZONE: us-central1-a
+  VM_USER: ubuntu
 
 jobs:
-  deploy:
-    name: Deploy DefectDojo on Existing Instance
+  provision:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Debug SSH key
-        run: |
-          echo "Key fingerprint:"
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" | ssh-keygen -l -f /dev/stdin || echo "Invalid key format"
-          echo "VM User: ${{ secrets.VM_USER }}"
-          echo "IP starts with: $(echo '${{ secrets.INSTANCE_IP }}' | cut -c1-3)..."
-      - name: Install Ansible
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ansible
+      - uses: actions/checkout@v4
 
-      - name: Create SSH private key file
+      # ── Auth ────────────────────────────────────────────────────────────────
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      # ── Terraform ───────────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Terraform Init & Apply
+        working-directory: infrastructure/gcp
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          terraform init \
+            -backend-config="bucket=${{ secrets.GCP_PROJECT_ID }}-tfstate" \
+            -backend-config="prefix=terraform/state"
+
+          terraform apply -auto-approve \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
+            -var="region=${{ env.GCP_REGION }}" \
+            -var="zone=${{ env.GCP_ZONE }}"
+
+          # Capture outputs
+          echo "INSTANCE_IP=$(terraform output -raw instance_ip)"         >> $GITHUB_ENV
+          echo "INSTANCE_NAME=$(terraform output -raw instance_name)"     >> $GITHUB_ENV
+
+      # ── SSH Key (temp, generated fresh every run) ───────────────────────────
+      - name: Generate temporary SSH key
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
+          echo "✅ SSH key generated"
+
+      - name: Push SSH public key to VM via gcloud
+        run: |
+          # Waits until the VM is ready before pushing the key
+          echo "⏳ Waiting for VM to be ready..."
+          for i in $(seq 1 12); do
+            STATUS=$(gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
+              --zone=${{ env.GCP_ZONE }} \
+              --format="value(status)")
+            echo "  VM status: $STATUS"
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "✅ VM is running"
+              break
+            fi
+            sleep 10
+          done
+
+          # Push the temp public key to VM metadata
+          gcloud compute instances add-metadata ${{ env.INSTANCE_NAME }} \
+            --zone=${{ env.GCP_ZONE }} \
+            --metadata="ssh-keys=${{ env.VM_USER }}:$(cat ~/.ssh/deploy_key.pub)"
+
+          echo "✅ SSH public key pushed to VM"
 
       - name: Test SSH connection
         run: |
-          echo "Testing SSH connection to ${{ secrets.INSTANCE_IP }}..."
-          ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=10 \
-            ${{ secrets.VM_USER }}@${{ secrets.INSTANCE_IP }} \
-            "echo '✅ SSH connection successful' && uname -a"
+          echo "⏳ Waiting for SSH to be available..."
+          sleep 15
 
-      - name: Create Ansible
-        run: |
-          cat > /tmp/inventory.ini << EOF
-          [defectdojo]
-          ${{ secrets.INSTANCE_IP }} ansible_user=${{ secrets.VM_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key ansible_ssh_common_args='-o StrictHostKeyChecking=no'           EOF
-          
-          echo "Inventory created:"
-          cat /tmp/inventory.ini
-
-      - name: Run Ansible Playbook
-        run: |
-          ansible-playbook \
-            -i /tmp/inventory.ini \
-            ansible/site.yml \
-            -e "db_password=${{ secrets.DB_PASSWORD }}" \
-            -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
-            -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
-            -e "defectdojo_port=${{ env.DEFECTDOJO_PORT }}" \
-            -v
-
-      - name: Verify DefectDojo is accessible
-        run: |
-          echo "⏳ Verifying DefectDojo accessibility..."
-          sleep 10
-          
           for i in $(seq 1 10); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}/login?next=/" || echo "000")
-            
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ DefectDojo is accessible! (HTTP $HTTP_CODE)"
+            if ssh -i ~/.ssh/deploy_key \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=10 \
+                ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} \
+                "echo '✅ SSH connection successful'"; then
+              echo "✅ SSH is ready"
               break
             else
-              echo "  Attempt $i/10 - HTTP $HTTP_CODE - retrying in 10s..."
+              echo "  Attempt $i/10 - retrying in 10s..."
               sleep 10
             fi
           done
 
-      - name: Print access details
+      # ── Ansible ─────────────────────────────────────────────────────────────
+      - name: Copy Ansible files to VM
         run: |
-          echo ""
-          echo "=============================================="
-          echo "  ✅ DefectDojo Deployment Complete!"
-          echo "=============================================="
-          echo ""
-          echo "  🌐 Access URL:"
-          echo "     http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}"
-          echo ""
-          echo "  👤 Username: admin"
-          echo "  🔑 Password: (your DD_ADMIN_PASSWORD secret)"
-          echo ""
-          echo "  📊 SSH Access:"
-          echo "     ssh ${{ secrets.VM_USER }}@${{ secrets.INSTANCE_IP }}
-          echo ""
-          echo "=============================================="
-          echo ""
-          echo "Next steps:"
-          echo "1. Access DefectDojo at the URL above"
-          echo "2. Login with admin credentials"
-          echo "3. Start your first engagement!"
-          echo ""
-          echo "Useful commands on the server:"
-          echo "  cd /opt/defectdojo"
-          echo "  ./healthcheck.sh      # Check service status"
-          echo "  ./backup.sh           # Create backup"
-          echo "  docker compose ps     # View containers"
-          echo "  docker logs dojo-uwsgi --tail 50  # View logs"
-          echo "=============================================="
+          tar -czf ansible.tar.gz ansible/
 
-      - name: Save deployment info
+          scp -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            ansible.tar.gz \
+            ${{ env.VM_USER }}@${{ env.INSTANCE_IP }}:~/ansible.tar.gz
+
+          echo "✅ Ansible files copied"
+
+      - name: Run Ansible playbook on VM
         run: |
-          cat > deployment-info.txt << EOF
-          ════════════════════════════════════════════════════════
-                    DefectDojo Deployment Information
-          ════════════════════════════════════════════════════════
-          
-          Deployment Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          Instance IP: ${{ secrets.INSTANCE_IP }}
-          DefectDojo URL: http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}
-          
-          ────────────────────────────────────────────────────────
-          Access Credentials
-          ────────────────────────────────────────────────────────
-          Username: admin
-          Password: <stored in DD_ADMIN_PASSWORD secret>
-          
-          ────────────────────────────────────────────────────────
-          Services Running
-          ────────────────────────────────────────────────────────
-          • DefectDojo Web:    http://${{ secrets.INSTANCE_IP }}:${{ env.DEFECTDOJO_PORT }}
-          • PostgreSQL:        Internal (port 5432)
-          • Redis:             Internal (port 6379)
-          • Celery Worker:     Background tasks
-          • Celery Beat:       Scheduled tasks
-          
-          ────────────────────────────────────────────────────────
-          Server Management
-          ────────────────────────────────────────────────────────
-          SSH: ssh ubuntu@${{ secrets.INSTANCE_IP }}
-          
-          Useful Commands:
-            cd /opt/defectdojo
-            ./healthcheck.sh              # Check all services
-            ./backup.sh                   # Backup database
-            docker compose ps             # Container status
-            docker compose logs -f        # Follow all logs
-            docker logs dojo-uwsgi        # Web server logs
-            docker logs defectdojo-db     # Database logs
-          
-          ────────────────────────────────────────────────────────
-          Troubleshooting
-          ────────────────────────────────────────────────────────
-          If DefectDojo is not accessible:
-            1. Check firewall: Port ${{ env.DEFECTDOJO_PORT }} must be open
-            2. Check containers: docker compose ps
-            3. Check logs: docker logs dojo-uwsgi --tail 50
-            4. Run health check: ./healthcheck.sh
-          
-          ════════════════════════════════════════════════════════
-          EOF
-          
-          cat deployment-info.txt
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
+              set -e
 
-      - name: Upload deployment info artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-info
-          path: deployment-info.txt
-          retention-days: 30
+              echo "📦 Installing dependencies..."
+              sudo apt-get update -qq
+              sudo apt-get install -y ansible docker.io docker-compose-v2
+
+              echo "📂 Extracting Ansible files..."
+              tar -xzf ~/ansible.tar.gz
+
+              echo "🚀 Running Ansible playbook..."
+              cd ~/ansible
+              sudo ansible-playbook -i localhost, -c local site.yml \
+                -e "db_password=${{ secrets.DB_PASSWORD }}" \
+                -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
+                -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}"
+
+              echo "✅ Ansible completed"
+          ENDSSH
+
+      # ── Verify ──────────────────────────────────────────────────────────────
+      - name: Verify DefectDojo is accessible
+        run: |
+          echo "⏳ Waiting for DefectDojo to start..."
+          sleep 30
+
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${{ env.INSTANCE_IP }}:8080/login?next=/" || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ DefectDojo is accessible! (HTTP $HTTP_CODE)"
+              break
+            else
+              echo "  Attempt $i/12 - HTTP $HTTP_CODE - retrying in 15s..."
+              sleep 15
+            fi
+          done
+
+      # ── Cleanup ─────────────────────────────────────────────────────────────
+      - name: Remove temporary SSH key from VM
+        if: always()
+        run: |
+          gcloud compute instances remove-metadata ${{ env.INSTANCE_NAME }} \
+            --zone=${{ env.GCP_ZONE }} \
+            --keys="ssh-keys" || echo "⚠️ Could not remove SSH key metadata"
+          echo "✅ Temporary SSH key removed from VM"
+
+      # ── Summary ─────────────────────────────────────────────────────────────
+      - name: Print deployment summary
+        if: success()
+        run: |
+          echo "=============================================="
+          echo "  ✅ Deployment Complete!"
+          echo "=============================================="
+          echo "  🌐 DefectDojo: http://${{ env.INSTANCE_IP }}:8080"
+          echo "  👤 Username:   admin"
+          echo "  🔑 Password:   (DD_ADMIN_PASSWORD secret)"
+          echo "  📊 SSH:        ssh ubuntu@${{ env.INSTANCE_IP }}"
+          echo "=============================================="
