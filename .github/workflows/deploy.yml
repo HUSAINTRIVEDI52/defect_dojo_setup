@@ -9,7 +9,7 @@ env:
   GCP_ZONE: us-central1-a
   VM_USER: ubuntu
   # Fallback in case Terraform output fails
-  INSTANCE_NAME: defectdojo-vm
+  INSTANCE_NAME: defectdojo-vm1
 
 jobs:
   provision:
