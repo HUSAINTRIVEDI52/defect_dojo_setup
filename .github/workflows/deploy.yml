@@ -17,7 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Auth ────────────────────────────────────────────────────────────────
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -28,7 +27,6 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      # ── Terraform ───────────────────────────────────────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -36,11 +34,10 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Apply
-         working-directory: infrastructure/gcp
+        working-directory: infrastructure/gcp
         run: |
           terraform init
 
-          # Import existing resources if they already exist
           terraform import google_compute_network.defectdojo_vpc \
             projects/${{ secrets.GCP_PROJECT_ID }}/global/networks/defectdojo-vpc 2>/dev/null || true
 
@@ -59,6 +56,9 @@ jobs:
           terraform import google_compute_firewall.allow_internal \
             projects/${{ secrets.GCP_PROJECT_ID }}/global/firewalls/defectdojo-allow-internal 2>/dev/null || true
 
+          terraform import google_compute_instance.defectdojo \
+            projects/${{ secrets.GCP_PROJECT_ID }}/zones/us-central1-a/instances/defectdojo-vm 2>/dev/null || true
+
           terraform apply -auto-approve \
             -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
@@ -68,7 +68,6 @@ jobs:
           echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
           echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
 
-      # ── SSH Key (temp, generated fresh every run) ───────────────────────────
       - name: Generate temporary SSH key
         run: |
           ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
@@ -114,7 +113,6 @@ jobs:
             fi
           done
 
-      # ── Ansible ─────────────────────────────────────────────────────────────
       - name: Copy Ansible files to VM
         run: |
           tar -czf ansible.tar.gz ansible/
@@ -150,7 +148,6 @@ jobs:
               echo "Ansible completed"
           ENDSSH
 
-      # ── Verify ──────────────────────────────────────────────────────────────
       - name: Verify DefectDojo is accessible
         run: |
           echo "Waiting for DefectDojo to start..."
@@ -169,7 +166,6 @@ jobs:
             fi
           done
 
-      # ── Cleanup ─────────────────────────────────────────────────────────────
       - name: Remove temporary SSH key from VM
         if: always()
         run: |
@@ -182,7 +178,6 @@ jobs:
             echo "INSTANCE_NAME not set, skipping cleanup"
           fi
 
-      # ── Summary ─────────────────────────────────────────────────────────────
       - name: Print deployment summary
         if: success()
         run: |
