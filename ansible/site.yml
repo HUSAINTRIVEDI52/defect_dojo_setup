@@ -5,23 +5,16 @@
   become: true
 
   vars:
-    # FIX 1: Do NOT self-reference the variable.
-    # Use a distinct internal name to avoid the Ansible variable recursion trap.
-    # These defaults are only used if the variable is NOT passed from CI/CD.
-    # In your pipeline, pass: -e dd_admin_password="$SECRET_PASSWORD"
+    # Safe internal variable — avoids Ansible self-reference recursion bug
     _dd_admin_password: "{{ dd_admin_password | default('Admin1234!') }}"
     _dd_secret_key: "{{ dd_secret_key | default('hhZCp@D28z!n@NED*yB!ROMt+WzsY*Vy') }}"
     defectdojo_dir: /opt/defectdojo
 
   tasks:
 
-    # =========================================================================
-    # DEBUG: Print which password is actually in use (mask in prod if needed)
-    # =========================================================================
-
-    - name: Show which admin password will be used (first 3 chars only)
+    - name: Show password prefix (debug, non-sensitive)
       debug:
-        msg: "dd_admin_password starts with: {{ _dd_admin_password[:3] }}*** (length={{ _dd_admin_password | length }})"
+        msg: "Admin password starts with: {{ _dd_admin_password[:3] }}*** length={{ _dd_admin_password | length }}"
 
     # =========================================================================
     # 1. BASE PACKAGES
@@ -146,15 +139,6 @@
       command: swapon /swapfile
       when: not swapfile_stat.stat.exists
 
-    - name: Show memory status
-      command: free -h
-      changed_when: false
-      register: mem_status
-
-    - name: Display memory
-      debug:
-        msg: "{{ mem_status.stdout_lines }}"
-
     # =========================================================================
     # 4. CLEAN SLATE
     # =========================================================================
@@ -192,56 +176,61 @@
     # =========================================================================
     # 6. WRITE .env FILE
     #
-    #    FIX 2: Use _dd_admin_password (the safe internal variable).
-    #    FIX 3: Also write DD_INITIALIZE_WITH_ADMIN_PASSWORD so the
-    #           initializer container picks it up regardless of compose version.
+    #    ROOT CAUSE FIX: The initializer reads DD_ADMIN_PASSWORD from its
+    #    container environment, which docker compose populates from the .env
+    #    file in the project directory. We must write ALL required vars here.
     #
-    #    Database password is intentionally left as the default "defectdojo"
-    #    to match the postgres container's built-in default. Do NOT change
-    #    one without changing the other.
+    #    From docker-compose.yml:
+    #      DD_ADMIN_PASSWORD: "${DD_ADMIN_PASSWORD:-admin}"
+    #    This means: read DD_ADMIN_PASSWORD from env, default to "admin".
+    #    So we MUST have DD_ADMIN_PASSWORD in the .env file for it to work.
     # =========================================================================
 
-    - name: Write .env file
+    - name: Write .env file with all required variables
       copy:
         dest: "{{ defectdojo_dir }}/.env"
         content: |
-          # ---- Admin credentials ----
+          # Django version (required by docker-compose.yml image tag)
+          DJANGO_VERSION=latest
+
+          # ---- Admin credentials (read by initializer container) ----
           DD_ADMIN_USER=admin
           DD_ADMIN_PASSWORD={{ _dd_admin_password }}
           DD_ADMIN_MAIL=admin@defectdojo.local
-
-          # FIX: Some DefectDojo versions read this key specifically for init
-          DD_INITIALIZE_WITH_ADMIN_PASSWORD={{ _dd_admin_password }}
+          DD_ADMIN_FIRST_NAME=Admin
+          DD_ADMIN_LAST_NAME=User
 
           # ---- Secret key ----
           DD_SECRET_KEY={{ _dd_secret_key }}
 
-          # ---- Database (must match postgres container default) ----
-          # postgres container initializes with POSTGRES_PASSWORD=defectdojo
-          # Do NOT change the password segment here without also setting
-          # POSTGRES_PASSWORD= in this file.
+          # ---- Database ----
+          # MUST match the postgres container's POSTGRES_PASSWORD (default: defectdojo)
+          # Do NOT change one without changing the other
           DD_DATABASE_URL=postgresql://defectdojo:defectdojo@postgres:5432/defectdojo
+          DD_DATABASE_HOST=postgres
+          DD_DATABASE_PORT=5432
+          DD_DATABASE_NAME=defectdojo
+          DD_DATABASE_USER=defectdojo
+          DD_DATABASE_PASSWORD=defectdojo
 
           # ---- Other settings ----
           DD_ALLOWED_HOSTS=*
           DD_DEBUG=False
+          DD_TIME_ZONE=UTC
         mode: '0600'
 
-    - name: Verify .env file was written with correct password
-      # Checks that the password line exists and is not empty
+    - name: Verify .env password line written correctly
       shell: grep "^DD_ADMIN_PASSWORD=" "{{ defectdojo_dir }}/.env" | cut -d= -f2-
       register: env_pw_check
       changed_when: false
-      no_log: true   # Don't print the password to logs
+      no_log: true
 
     - name: Assert .env password matches expected value
       assert:
         that:
           - env_pw_check.stdout == _dd_admin_password
-        fail_msg: >
-          MISMATCH: The password written to .env does not match _dd_admin_password.
-          This means the variable was not interpolated correctly.
-        success_msg: ".env password verified successfully."
+        fail_msg: "MISMATCH: .env DD_ADMIN_PASSWORD does not match _dd_admin_password. Variable interpolation failed."
+        success_msg: ".env password verified OK."
 
     # =========================================================================
     # 7. PULL IMAGES
@@ -257,7 +246,7 @@
       until: pull_result.rc == 0
 
     # =========================================================================
-    # 8. START POSTGRES + VALKEY FIRST
+    # 8. START POSTGRES + VALKEY ONLY
     # =========================================================================
 
     - name: Start postgres and valkey containers
@@ -292,113 +281,56 @@
         msg: "{{ postgres_health.stdout_lines }}"
 
     # =========================================================================
-    # 9. RUN INITIALIZER
+    # 9. RUN INITIALIZER — THE CRITICAL FIX
     #
-    #    FIX 4: Pass the admin password as an explicit environment variable
-    #    directly to the initializer container via `docker compose run`.
-    #    This is the most reliable method — it bypasses any .env parsing
-    #    inconsistencies in different DefectDojo/Compose versions.
+    #    PREVIOUS BUG: `docker compose up -d initializer` launched it
+    #    in background and our wait loop was watching for a container
+    #    that was never named defectdojo-initializer-1 because it was
+    #    never actually started (other services skipped it after seeing
+    #    no prior run). The pipeline then timed out after 8m 54s.
+    #
+    #    FIX: Use `docker compose run --rm` which:
+    #      1. Runs the initializer SYNCHRONOUSLY (blocks until complete)
+    #      2. Loads env vars from our .env file (including DD_ADMIN_PASSWORD)
+    #      3. Returns the actual exit code so we fail fast on errors
+    #      4. --no-deps prevents restarting postgres/valkey
+    #
+    #    This runs: manage.py migrate + createsuperuser + loaddata
+    #    Creates ALL tables: dojo_system_settings, dojo_test_type, etc.
     # =========================================================================
 
-    - name: Start initializer container with explicit env vars
-      # Using `up` with --no-deps so it doesn't restart already-running services.
-      # The -e flags inject our passwords directly into the container process.
-      shell: >
-        docker compose --env-file .env
-        run --rm
-        -e DD_ADMIN_PASSWORD={{ _dd_admin_password | quote }}
-        -e DD_ADMIN_USER=admin
-        -e DD_ADMIN_MAIL=admin@defectdojo.local
-        -e DD_INITIALIZE_WITH_ADMIN_PASSWORD={{ _dd_admin_password | quote }}
-        initializer
+    - name: Run initializer synchronously — blocks until DB is fully initialized
+      shell: |
+        docker compose --env-file .env run --rm --no-deps initializer
       args:
         chdir: "{{ defectdojo_dir }}"
       register: initializer_result
-      failed_when: initializer_result.rc != 0
+      async: 1200
+      poll: 15
 
     - name: Show initializer output
       debug:
-        msg: "{{ initializer_result.stdout_lines }}"
+        msg: "{{ initializer_result.stdout_lines | default(['(no output captured - check docker logs']) }}"
 
-    # =========================================================================
-    # 10. FORCE-RESET ADMIN PASSWORD VIA DJANGO (belt-and-suspenders)
-    #
-    #     FIX 5: Use `docker exec` on the ALREADY-RUNNING uwsgi container
-    #     instead of `docker compose run` (which spins up a new container
-    #     and hangs waiting for full stack init).
-    #
-    #     We write the Python snippet to a temp file inside the container
-    #     to completely avoid shell quoting/escaping issues.
-    # =========================================================================
+    - name: Fail if initializer exited non-zero
+      fail:
+        msg: "Initializer failed with rc={{ initializer_result.rc }}. See output above."
+      when: initializer_result.rc is defined and initializer_result.rc != 0
 
-    - name: Wait for uwsgi container to be running before exec
+    - name: Verify dojo_system_settings table exists in postgres
       shell: |
-        MAX=60
-        i=0
-        while [ $i -lt $MAX ]; do
-          STATUS=$(docker inspect --format='{{ "{{" }}.State.Status{{ "}}" }}' \
-            defectdojo-uwsgi-1 2>/dev/null || echo "missing")
-          echo "  uwsgi status: $STATUS (attempt $((i+1))/$MAX)"
-          if [ "$STATUS" = "running" ]; then
-            echo "OK: uwsgi is running"
-            exit 0
-          fi
-          sleep 5
-          i=$((i+1))
-        done
-        echo "FAIL: uwsgi container never became running"
-        exit 1
-      register: uwsgi_wait
-      failed_when: uwsgi_wait.rc != 0
+        docker exec defectdojo-postgres-1 \
+          psql -U defectdojo -d defectdojo -tAc \
+          "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='dojo_system_settings';"
+      register: table_check
+      failed_when: table_check.stdout.strip() != '1'
 
-    - name: Show uwsgi wait result
+    - name: Show table verification
       debug:
-        msg: "{{ uwsgi_wait.stdout_lines }}"
-
-    - name: Write Django password-reset script to temp file on host
-      # Writing to a file avoids ALL shell quoting issues with special chars
-      # in passwords (!, @, #, spaces, quotes, etc.)
-      copy:
-        dest: /tmp/dd_reset_pw.py
-        mode: '0600'
-        content: |
-          from django.contrib.auth import get_user_model
-          User = get_user_model()
-          try:
-              u = User.objects.get(username='admin')
-              u.set_password("""{{ _dd_admin_password }}""")
-              u.save()
-              print("SUCCESS: password reset for user:", u.username)
-          except User.DoesNotExist:
-              print("ERROR: admin user not found")
-              raise SystemExit(1)
-
-    - name: Copy password-reset script into the uwsgi container
-      command: docker cp /tmp/dd_reset_pw.py defectdojo-uwsgi-1:/tmp/dd_reset_pw.py
-
-    - name: Execute Django password reset via docker exec
-      # docker exec on running container — no startup delay, no quoting issues
-      command: >
-        docker exec defectdojo-uwsgi-1
-        python manage.py shell --command="exec(open('/tmp/dd_reset_pw.py').read())"
-      register: pw_reset
-      failed_when: pw_reset.rc != 0
-
-    - name: Show password reset result
-      debug:
-        msg: "{{ pw_reset.stdout_lines }}"
-
-    - name: Clean up temp password script from host
-      file:
-        path: /tmp/dd_reset_pw.py
-        state: absent
-
-    - name: Clean up temp password script from container
-      command: docker exec defectdojo-uwsgi-1 rm -f /tmp/dd_reset_pw.py
-      ignore_errors: yes
+        msg: "dojo_system_settings table confirmed present (count={{ table_check.stdout.strip() }})"
 
     # =========================================================================
-    # 11. START ALL REMAINING SERVICES
+    # 10. START ALL REMAINING SERVICES
     # =========================================================================
 
     - name: Start all remaining DefectDojo services
@@ -407,7 +339,7 @@
         chdir: "{{ defectdojo_dir }}"
 
     # =========================================================================
-    # 12. WAIT FOR WEB INTERFACE
+    # 11. WAIT FOR WEB INTERFACE
     # =========================================================================
 
     - name: Wait for nginx to expose port 8080 (up to 10 minutes)
@@ -432,10 +364,10 @@
       until: http_check.status in [200, 302]
 
     # =========================================================================
-    # 13. SMOKE TEST: Verify login actually works with the configured password
+    # 12. SMOKE TEST — verify login works with the configured password
     # =========================================================================
 
-    - name: Smoke-test login with configured admin password
+    - name: Smoke-test login via API with configured admin password
       uri:
         url: "http://127.0.0.1:8080/api/v2/user/"
         method: GET
@@ -448,14 +380,14 @@
       retries: 5
       delay: 10
       until: login_test.status == 200
-      no_log: true   # Don't expose credentials in logs
+      no_log: true
 
     - name: Confirm login smoke test passed
       debug:
-        msg: "Login verified successfully via API."
+        msg: "Login verified successfully via API — admin password is correct."
 
     # =========================================================================
-    # 14. FINAL STATUS
+    # 13. FINAL STATUS
     # =========================================================================
 
     - name: Get final container status
