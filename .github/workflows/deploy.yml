@@ -2,16 +2,13 @@ name: Infrastructure Setup (Permanent)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - Infra-Pipeline
 
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_REGION: us-central1
   GCP_ZONE: us-central1-a
   VM_USER: ubuntu
-  INSTANCE_NAME: defectdojo-vm1
+  INSTANCE_NAME: defectdojo-vm
 
 jobs:
   provision:
@@ -47,9 +44,6 @@ jobs:
         working-directory: infrastructure/gcp
         run: |
           terraform init
-          # IMPORTANT: DefectDojo needs minimum 4GB RAM.
-          # e2-micro (1GB) will OOM-kill the initializer — use e2-standard-2 (8GB) minimum.
-          # e2-medium (4GB) works but is tight; e2-standard-2 is recommended for stability.
           terraform apply -auto-approve \
             -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
@@ -83,24 +77,22 @@ jobs:
               --format="value(status)" 2>/dev/null || echo "UNKNOWN")
             echo "  VM status: $STATUS (attempt $i/24)"
             if [ "$STATUS" = "RUNNING" ]; then
-              echo "✓ VM is RUNNING"
+              echo "VM is RUNNING"
               break
             fi
             if [ $i -eq 24 ]; then
-              echo "✗ VM never reached RUNNING state"
+              echo "VM never reached RUNNING state after 4 minutes"
               exit 1
             fi
             sleep 10
           done
-
           gcloud compute instances add-metadata ${{ env.INSTANCE_NAME }} \
             --zone=${{ env.GCP_ZONE }} \
             --metadata="ssh-keys=${{ env.VM_USER }}:$(cat ~/.ssh/deploy_key.pub)"
-          echo "✓ SSH public key pushed to VM"
+          echo "SSH key pushed to VM"
 
       - name: Wait for SSH to be ready
         run: |
-          echo "Waiting for SSH service..."
           sleep 20
           for i in $(seq 1 30); do
             if ssh -i ~/.ssh/deploy_key \
@@ -108,21 +100,21 @@ jobs:
                 -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=10 \
                 ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} \
-                "echo 'SSH Ready'" 2>/dev/null; then
-              echo "✓ SSH is ready"
+                "echo SSH_READY" 2>/dev/null | grep -q "SSH_READY"; then
+              echo "SSH is ready"
               exit 0
             fi
             echo "  Attempt $i/30 - retrying in 10s..."
             sleep 10
           done
-          echo "✗ SSH failed to become ready after 5 minutes"
+          echo "SSH failed to become ready after 5 minutes"
           exit 1
 
       - name: Copy Ansible files to VM
         run: |
           cd "${GITHUB_WORKSPACE}"
           if [ ! -d "ansible" ]; then
-            echo "✗ ERROR: ansible directory not found in workspace!"
+            echo "ERROR: ansible directory not found in workspace"
             ls -la
             exit 1
           fi
@@ -132,7 +124,110 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             ansible.tar.gz \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }}:~/ansible.tar.gz
-          echo "✓ Ansible files copied"
+          echo "Ansible files copied to VM"
+
+      - name: Bootstrap VM — install Docker CE + Ansible
+        # This runs BEFORE Ansible so Docker is installed the right way
+        # (from Docker's official repo, not docker.io) before Ansible touches it.
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'BOOTSTRAP'
+            set -e
+
+            echo "========== VM Bootstrap =========="
+
+            # Wait for cloud-init to finish
+            echo "Waiting for cloud-init..."
+            sudo cloud-init status --wait 2>/dev/null || true
+            sleep 15
+
+            # Kill apt/dpkg locks
+            echo "Clearing package locks..."
+            sudo systemctl stop unattended-upgrades 2>/dev/null || true
+            sudo systemctl disable unattended-upgrades 2>/dev/null || true
+            sudo killall -9 unattended-upgrade apt-get apt dpkg 2>/dev/null || true
+            sleep 5
+            sudo rm -f /var/lib/dpkg/lock-frontend \
+                       /var/lib/dpkg/lock \
+                       /var/cache/apt/archives/lock \
+                       /var/lib/apt/lists/lock
+            sudo dpkg --configure -a 2>/dev/null || true
+
+            # Update apt
+            echo "Updating apt..."
+            for i in $(seq 1 5); do
+              sudo apt-get update -qq && break
+              echo "  apt-get update retry $i/5..."
+              sleep 15
+            done
+
+            # Install prerequisites
+            echo "Installing prerequisites..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              ca-certificates curl gnupg lsb-release \
+              software-properties-common ansible python3-pip git
+
+            # Remove old docker packages
+            echo "Removing old docker packages..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y \
+              docker.io docker-compose containerd 2>/dev/null || true
+
+            # Add Docker's official GPG key + repo
+            echo "Adding Docker official repo..."
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+              https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+              | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+            sudo apt-get update -qq
+
+            # Install Docker CE + Compose plugin
+            echo "Installing Docker CE..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              docker-ce docker-ce-cli containerd.io \
+              docker-buildx-plugin docker-compose-plugin
+
+            sudo systemctl enable docker
+            sudo systemctl start docker
+
+            # Wait for Docker daemon
+            echo "Waiting for Docker daemon..."
+            for i in $(seq 1 20); do
+              if sudo docker info > /dev/null 2>&1; then
+                echo "Docker is ready"
+                break
+              fi
+              echo "  attempt $i/20..."
+              sleep 5
+            done
+
+            # Add 4GB swap as safety net
+            if [ ! -f /swapfile ]; then
+              echo "Adding 4GB swap..."
+              sudo fallocate -l 4G /swapfile
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile
+            fi
+
+            echo ""
+            echo "--- Installed versions ---"
+            ansible --version | head -n1
+            sudo docker --version
+            sudo docker compose version
+            free -h
+            echo "--------------------------"
+            echo "Bootstrap complete"
+          BOOTSTRAP
 
       - name: Run Ansible playbook on VM
         run: |
@@ -140,181 +235,79 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=60 \
+            -o ServerAliveCountMax=120 \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
             set -e
 
-            echo "=========================================="
-            echo "Setting up DefectDojo on VM"
-            echo "=========================================="
+            echo "========== Running Ansible Playbook =========="
 
-            # Wait for cloud-init to complete
-            echo "⏳ Waiting for cloud-init..."
-            sudo cloud-init status --wait 2>/dev/null || true
-
-            # Give system time to settle
-            echo "⏳ Letting system settle (30s)..."
-            sleep 30
-
-            # Stop unattended upgrades to avoid dpkg lock conflicts
-            echo "🛑 Stopping unattended-upgrades..."
-            sudo systemctl stop unattended-upgrades 2>/dev/null || true
-            sudo systemctl disable unattended-upgrades 2>/dev/null || true
-            sudo killall -9 unattended-upgrade apt-get apt 2>/dev/null || true
-            sleep 5
-
-            # Release any dpkg locks
-            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
-            sudo dpkg --configure -a 2>/dev/null || true
-
-            # Enable universe repository
-            echo "📦 Enabling universe repository..."
-            sudo add-apt-repository universe -y
-
-            # Update package lists with retry
-            echo "🔄 Updating package lists..."
-            for i in {1..5}; do
-              if sudo apt-get update -qq; then
-                echo "✓ Package lists updated"
-                break
-              fi
-              echo "  Retry $i/5 in 15s..."
-              sleep 15
-            done
-
-            # Install Ansible
-            echo "📥 Installing Ansible..."
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              software-properties-common \
-              ansible \
-              python3-pip
-
-            # Install Docker
-            echo "📥 Installing Docker..."
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
-            sudo systemctl enable docker
-            sudo systemctl start docker
-
-            # Wait for Docker to be truly ready
-            echo "⏳ Waiting for Docker daemon..."
-            for i in {1..12}; do
-              if sudo docker info > /dev/null 2>&1; then
-                echo "✓ Docker is ready"
-                break
-              fi
-              echo "  Waiting for Docker... attempt $i/12"
-              sleep 5
-            done
-
-            # Install Docker Compose plugin (preferred) with fallback
-            echo "📥 Installing Docker Compose..."
-            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin 2>/dev/null; then
-              echo "✓ docker-compose-plugin installed"
-            else
-              echo "⚠ Falling back to standalone docker-compose..."
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose
-            fi
-
-            # Verify all tools are present
-            echo ""
-            echo "--- Tool Versions ---"
-            ansible --version | head -n1
-            sudo docker --version
-            sudo docker compose version 2>/dev/null || docker-compose version
-            echo "---------------------"
-            echo ""
-
-            # Verify system has enough RAM (warn if < 3GB)
-            TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-            TOTAL_RAM_GB=$((TOTAL_RAM_KB / 1024 / 1024))
-            echo "⚙ System RAM: ~${TOTAL_RAM_GB}GB"
-            if [ "$TOTAL_RAM_GB" -lt 3 ]; then
-              echo "⚠ WARNING: Less than 3GB RAM detected!"
-              echo "  DefectDojo requires minimum 4GB RAM."
-              echo "  The initializer container WILL likely fail."
-              echo "  Please use machine_type=e2-standard-2 or larger."
-              # Do NOT exit here — let it try and give you the real logs
-            fi
-
-            # Add swap space if RAM is low (helps on tight machines)
-            if [ "$TOTAL_RAM_GB" -lt 4 ]; then
-              echo "📦 Adding 4GB swap space to supplement RAM..."
-              if [ ! -f /swapfile ]; then
-                sudo fallocate -l 4G /swapfile
-                sudo chmod 600 /swapfile
-                sudo mkswap /swapfile
-                sudo swapon /swapfile
-                echo "✓ Swap space added"
-                free -h
-              fi
-            fi
-
-            # Extract and run Ansible playbook
-            echo "📂 Extracting Ansible files..."
             tar -xzf ~/ansible.tar.gz
-
-            echo "🚀 Running Ansible playbook..."
             cd ~/ansible
 
-            # Run with verbose output so we see every task
             sudo ansible-playbook -i localhost, -c local site.yml \
               -e "db_password=${{ secrets.DB_PASSWORD }}" \
               -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
               -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
               -v
 
-            echo "=========================================="
-            echo "✓ Ansible playbook completed successfully"
-            echo "=========================================="
+            echo "========== Ansible complete =========="
           ENDSSH
 
       - name: Collect container logs on failure
         if: failure()
         run: |
-          echo "🔍 Collecting debug logs from VM..."
+          echo "Collecting debug info from VM..."
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'DEBUGSSH' || true
 
             echo "=== docker compose ps ==="
-            cd /opt/defectdojo && sudo docker compose ps 2>/dev/null || echo "no compose state"
+            cd /opt/defectdojo 2>/dev/null \
+              && sudo docker compose ps \
+              || echo "No compose state found — DefectDojo dir does not exist"
 
             echo ""
             echo "=== initializer logs ==="
-            sudo docker logs defectdojo-initializer-1 2>&1 | tail -100 || echo "no initializer container"
+            sudo docker logs defectdojo-initializer-1 2>&1 | tail -150 \
+              || echo "No initializer container found"
 
             echo ""
             echo "=== postgres logs ==="
-            sudo docker logs defectdojo-postgres-1 2>&1 | tail -50 || echo "no postgres container"
+            sudo docker logs defectdojo-postgres-1 2>&1 | tail -50 \
+              || echo "No postgres container found"
 
             echo ""
             echo "=== system memory ==="
             free -h
 
             echo ""
-            echo "=== docker system df ==="
-            sudo docker system df
+            echo "=== docker version ==="
+            sudo docker --version
+            sudo docker compose version 2>/dev/null || echo "docker compose plugin NOT found"
+
+            echo ""
+            echo "=== disk usage ==="
+            df -h /
           DEBUGSSH
 
       - name: Verify DefectDojo is accessible
         run: |
-          echo "Waiting for DefectDojo to be accessible..."
+          echo "Waiting for DefectDojo to come up..."
           sleep 30
           for i in $(seq 1 20); do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               --max-time 15 \
               "http://${{ env.INSTANCE_IP }}:8080/login?next=/" 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
-              echo "✓ DefectDojo is accessible — HTTP $HTTP_CODE"
+              echo "DefectDojo is accessible — HTTP $HTTP_CODE"
               exit 0
             fi
             echo "  Attempt $i/20 — HTTP $HTTP_CODE — retrying in 15s..."
             sleep 15
           done
-          echo "⚠ DefectDojo not accessible after all attempts"
-          echo "  Check manually: http://${{ env.INSTANCE_IP }}:8080"
-          # Not a hard failure — app may still be initializing
+          # Not a hard failure — app may need a bit more time
+          echo "DefectDojo not reachable yet — check http://${{ env.INSTANCE_IP }}:8080 manually"
           exit 0
 
       - name: Remove temporary SSH key from VM
@@ -329,14 +322,12 @@ jobs:
         run: |
           echo ""
           echo "=============================================="
-          echo "  ✓ DefectDojo Deployment Complete!"
+          echo "  DefectDojo Deployment Complete!"
           echo "=============================================="
-          echo ""
-          echo "  🌐 URL:      http://${{ env.INSTANCE_IP }}:8080"
-          echo "  👤 Username: admin"
-          echo "  🔑 Password: (DD_ADMIN_PASSWORD secret)"
-          echo ""
-          echo "  🔌 SSH:  ssh ubuntu@${{ env.INSTANCE_IP }}"
+          echo "  URL:      http://${{ env.INSTANCE_IP }}:8080"
+          echo "  Username: admin"
+          echo "  Password: (DD_ADMIN_PASSWORD secret)"
+          echo "  SSH:      ssh ubuntu@${{ env.INSTANCE_IP }}"
           echo "=============================================="
 
       - name: Debug information on failure
@@ -344,17 +335,12 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
-          echo "⚠ Deployment Failed — Debug Info"
+          echo "Deployment Failed — Debug Info"
           echo "=========================================="
           echo "  Instance: ${{ env.INSTANCE_NAME }}"
           echo "  IP:       ${{ env.INSTANCE_IP }}"
           echo "  Zone:     ${{ env.GCP_ZONE }}"
           echo ""
-          echo "  SSH into VM:"
-          echo "  gcloud compute ssh ${{ env.INSTANCE_NAME }} --zone=${{ env.GCP_ZONE }}"
-          echo ""
-          echo "  Then check:"
-          echo "  cd /opt/defectdojo && sudo docker compose logs initializer"
-          echo "  sudo docker compose logs postgres"
-          echo "  sudo docker compose ps"
+          echo "  SSH in:   gcloud compute ssh ${{ env.INSTANCE_NAME }} --zone=${{ env.GCP_ZONE }}"
+          echo "  Logs:     cd /opt/defectdojo && sudo docker compose logs initializer"
           echo "=========================================="

@@ -12,68 +12,168 @@
 
   tasks:
 
-    # -------------------------------------------------------------------------
-    # SYSTEM PREREQUISITES
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 1. BASE PACKAGES
+    # =========================================================================
 
-    - name: Install required packages
+    - name: Install required base packages
       apt:
         name:
           - git
           - curl
+          - ca-certificates
+          - gnupg
+          - lsb-release
           - python3-pip
         state: present
         update_cache: yes
 
-    - name: Ensure Docker is running
+    # =========================================================================
+    # 2. DOCKER CE + COMPOSE PLUGIN (official Docker repo — NOT docker.io)
+    #    docker.io from Ubuntu apt does NOT ship docker-compose-plugin.
+    #    DefectDojo's docker-compose.yml uses 'docker compose' (plugin syntax).
+    # =========================================================================
+
+    - name: Create Docker apt keyring directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker official GPG key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker official apt repository
+      shell: |
+        echo \
+          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+          https://download.docker.com/linux/ubuntu \
+          $(lsb_release -cs) stable" \
+          | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Remove conflicting old docker packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - containerd
+        state: absent
+      ignore_errors: yes
+
+    - name: Install Docker CE + Compose plugin
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is started and enabled
       systemd:
         name: docker
         state: started
         enabled: yes
 
-    - name: Verify Docker is functional
-      command: docker info
+    - name: Wait for Docker daemon to be ready
+      shell: |
+        for i in $(seq 1 24); do
+          if docker info > /dev/null 2>&1; then
+            echo "Docker daemon is ready"
+            exit 0
+          fi
+          echo "  Waiting for Docker... attempt $i/24"
+          sleep 5
+        done
+        echo "Docker daemon never became ready"
+        exit 1
       changed_when: false
-      register: docker_info
-      failed_when: docker_info.rc != 0
 
-    - name: Verify Docker Compose plugin is available
+    - name: Verify docker compose plugin works
       command: docker compose version
       changed_when: false
-      register: compose_version
-      failed_when: compose_version.rc != 0
+      register: compose_ver
+      failed_when: compose_ver.rc != 0
 
     - name: Show Docker Compose version
       debug:
-        msg: "Using: {{ compose_version.stdout }}"
+        msg: "{{ compose_ver.stdout }}"
 
-    # -------------------------------------------------------------------------
-    # CLEAN SLATE — tear down any previous broken attempt
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 3. SWAP — safety net in case RAM is borderline under load
+    # =========================================================================
 
-    - name: Check if defectdojo_dir already exists
+    - name: Check if swapfile already exists
+      stat:
+        path: /swapfile
+      register: swapfile_stat
+
+    - name: Create 4GB swap file
+      command: fallocate -l 4G /swapfile
+      when: not swapfile_stat.stat.exists
+
+    - name: Set swap file permissions
+      file:
+        path: /swapfile
+        mode: '0600'
+      when: not swapfile_stat.stat.exists
+
+    - name: Format swap file
+      command: mkswap /swapfile
+      when: not swapfile_stat.stat.exists
+
+    - name: Enable swap file
+      command: swapon /swapfile
+      when: not swapfile_stat.stat.exists
+
+    - name: Show memory status
+      command: free -h
+      changed_when: false
+      register: mem_status
+
+    - name: Display memory
+      debug:
+        msg: "{{ mem_status.stdout_lines }}"
+
+    # =========================================================================
+    # 4. CLEAN SLATE — remove any previous broken attempt
+    # =========================================================================
+
+    - name: Check if defectdojo directory exists from a previous run
       stat:
         path: "{{ defectdojo_dir }}"
       register: dojo_dir_stat
 
-    - name: Tear down any existing DefectDojo deployment (containers + volumes)
+    - name: Tear down any existing DefectDojo containers and volumes
       command: docker compose down -v --remove-orphans
       args:
         chdir: "{{ defectdojo_dir }}"
       when: dojo_dir_stat.stat.exists
-      ignore_errors: yes   # OK if nothing was running
+      ignore_errors: yes
 
-    - name: Remove existing DefectDojo directory for a clean clone
+    - name: Remove existing DefectDojo directory
       file:
         path: "{{ defectdojo_dir }}"
         state: absent
       when: dojo_dir_stat.stat.exists
 
-    # -------------------------------------------------------------------------
-    # CLONE & CONFIGURE
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 5. CLONE & CONFIGURE
+    # =========================================================================
 
-    - name: Clone DefectDojo repository (latest stable)
+    - name: Clone DefectDojo repository
       git:
         repo: https://github.com/DefectDojo/django-DefectDojo.git
         dest: "{{ defectdojo_dir }}"
@@ -81,7 +181,7 @@
         force: yes
         depth: 1
 
-    - name: Confirm .env.prod.template exists
+    - name: Confirm .env.prod.template exists in repo
       stat:
         path: "{{ defectdojo_dir }}/.env.prod.template"
       register: env_template
@@ -93,7 +193,7 @@
         dest: "{{ defectdojo_dir }}/.env.prod"
         remote_src: yes
 
-    - name: Configure DefectDojo environment variables
+    - name: Configure all DefectDojo environment variables
       lineinfile:
         path: "{{ defectdojo_dir }}/.env.prod"
         regexp: "{{ item.regexp }}"
@@ -107,17 +207,22 @@
         - { regexp: '^DD_DEBUG=',               line: 'DD_DEBUG=False' }
         - { regexp: '^DD_ADMIN_USER=',          line: 'DD_ADMIN_USER=admin' }
         - { regexp: '^DD_ADMIN_MAIL=',          line: 'DD_ADMIN_MAIL=admin@defectdojo.local' }
-        # Explicitly point at postgres service (not mysql — DefectDojo uses postgres)
         - { regexp: '^DD_DATABASE_HOST=',       line: 'DD_DATABASE_HOST=postgres' }
         - { regexp: '^DD_DATABASE_PORT=',       line: 'DD_DATABASE_PORT=5432' }
         - { regexp: '^DD_DATABASE_NAME=',       line: 'DD_DATABASE_NAME=defectdojo' }
         - { regexp: '^DD_DATABASE_USER=',       line: 'DD_DATABASE_USER=defectdojo' }
 
-    # -------------------------------------------------------------------------
-    # PULL IMAGES (separate from up — gives cleaner error if pull fails)
-    # -------------------------------------------------------------------------
+    - name: Confirm .env.prod was written correctly
+      shell: grep -c "DD_DATABASE_PASSWORD" "{{ defectdojo_dir }}/.env.prod"
+      register: env_check
+      changed_when: false
+      failed_when: env_check.rc != 0
 
-    - name: Pull all Docker images (may take several minutes)
+    # =========================================================================
+    # 6. PULL IMAGES
+    # =========================================================================
+
+    - name: Pull all Docker images
       command: docker compose pull
       args:
         chdir: "{{ defectdojo_dir }}"
@@ -130,11 +235,11 @@
       delay: 15
       until: pull_result.rc == 0
 
-    # -------------------------------------------------------------------------
-    # START INFRASTRUCTURE CONTAINERS FIRST (postgres + valkey only)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 7. START POSTGRES + VALKEY FIRST
+    # =========================================================================
 
-    - name: Start only postgres and valkey first
+    - name: Start postgres and valkey containers
       command: docker compose up -d postgres valkey
       args:
         chdir: "{{ defectdojo_dir }}"
@@ -143,24 +248,24 @@
         DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
         DD_SECRET_KEY: "{{ dd_secret_key }}"
 
-    - name: Wait for postgres to be healthy (up to 5 minutes)
+    - name: Wait for postgres to accept connections (up to 5 minutes)
       shell: |
-        set -e
         MAX=60
         i=0
         while [ $i -lt $MAX ]; do
-          STATUS=$(docker inspect --format='{{"{{"}}json .State.Health.Status{{"}}"}}' \
-                   defectdojo-postgres-1 2>/dev/null | tr -d '"' || echo "missing")
-          echo "  postgres health: $STATUS (attempt $((i+1))/$MAX)"
-          if [ "$STATUS" = "healthy" ]; then
-            echo "✓ postgres is healthy"
+          # Use pg_isready inside the container — most reliable health check
+          if docker exec defectdojo-postgres-1 \
+              pg_isready -U defectdojo -d defectdojo > /dev/null 2>&1; then
+            echo "OK: postgres is accepting connections"
             exit 0
           fi
+          echo "  postgres not ready yet... attempt $((i+1))/$MAX"
           sleep 5
           i=$((i+1))
         done
-        echo "✗ postgres never became healthy"
-        docker logs defectdojo-postgres-1 --tail 50
+        echo "FAIL: postgres never became ready after 5 minutes"
+        echo "=== POSTGRES LOGS ==="
+        docker logs defectdojo-postgres-1 --tail 50 2>&1 || true
         exit 1
       args:
         chdir: "{{ defectdojo_dir }}"
@@ -171,9 +276,9 @@
       debug:
         msg: "{{ postgres_health.stdout_lines }}"
 
-    # -------------------------------------------------------------------------
-    # START INITIALIZER AND CAPTURE ITS LOGS ON FAILURE
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 8. RUN INITIALIZER
+    # =========================================================================
 
     - name: Start initializer container
       command: docker compose up -d initializer
@@ -186,49 +291,49 @@
 
     - name: Wait for initializer to complete (up to 20 minutes)
       shell: |
-        set -e
-        MAX=240   # 240 × 5s = 20 minutes
+        MAX=240
         i=0
         while [ $i -lt $MAX ]; do
-          STATUS=$(docker inspect --format='{{"{{"}}json .State.Status{{"}}"}}' \
-                   defectdojo-initializer-1 2>/dev/null | tr -d '"' || echo "missing")
-          EXIT=$(docker inspect --format='{{"{{"}}json .State.ExitCode{{"}}"}}' \
-                 defectdojo-initializer-1 2>/dev/null | tr -d '"' || echo "unknown")
-          echo "  initializer status: $STATUS exitCode: $EXIT (attempt $((i+1))/$MAX)"
-
+          STATUS=$(docker inspect \
+            --format='{{"{{"}}json .State.Status{{"}}"}}' \
+            defectdojo-initializer-1 2>/dev/null | tr -d '"' || echo "missing")
+          EXIT=$(docker inspect \
+            --format='{{"{{"}}json .State.ExitCode{{"}}"}}' \
+            defectdojo-initializer-1 2>/dev/null | tr -d '"' || echo "unknown")
+          echo "  initializer: $STATUS  exit=$EXIT  (attempt $((i+1))/$MAX)"
           if [ "$STATUS" = "exited" ]; then
             if [ "$EXIT" = "0" ]; then
-              echo "✓ initializer completed successfully"
+              echo "OK: initializer completed successfully"
               exit 0
             else
-              echo "✗ initializer failed with exit code $EXIT"
-              echo "--- INITIALIZER LOGS ---"
+              echo "FAIL: initializer exited with code $EXIT"
+              echo "=== FULL INITIALIZER LOGS ==="
               docker logs defectdojo-initializer-1 2>&1
-              echo "--- END LOGS ---"
+              echo "=== END INITIALIZER LOGS ==="
               exit 1
             fi
           fi
           sleep 5
           i=$((i+1))
         done
-        echo "✗ initializer timed out after 20 minutes"
-        echo "--- INITIALIZER LOGS (last 100 lines) ---"
-        docker logs defectdojo-initializer-1 2>&1 | tail -100
+        echo "FAIL: initializer timed out after 20 minutes"
+        echo "=== INITIALIZER LOGS (last 150 lines) ==="
+        docker logs defectdojo-initializer-1 2>&1 | tail -150
         exit 1
       args:
         chdir: "{{ defectdojo_dir }}"
       register: initializer_wait
       failed_when: initializer_wait.rc != 0
 
-    - name: Show initializer output
+    - name: Show initializer result
       debug:
         msg: "{{ initializer_wait.stdout_lines }}"
 
-    # -------------------------------------------------------------------------
-    # START REMAINING SERVICES
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 9. START ALL REMAINING SERVICES
+    # =========================================================================
 
-    - name: Start remaining DefectDojo services
+    - name: Start all remaining DefectDojo services
       command: docker compose up -d
       args:
         chdir: "{{ defectdojo_dir }}"
@@ -237,11 +342,11 @@
         DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
         DD_SECRET_KEY: "{{ dd_secret_key }}"
 
-    # -------------------------------------------------------------------------
-    # WAIT FOR WEB INTERFACE
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 10. WAIT FOR WEB INTERFACE
+    # =========================================================================
 
-    - name: Wait for nginx/uwsgi to expose port 8080 (up to 10 minutes)
+    - name: Wait for nginx to expose port 8080 (up to 10 minutes)
       wait_for:
         host: 127.0.0.1
         port: 8080
@@ -253,16 +358,18 @@
       uri:
         url: "http://127.0.0.1:8080/login?next=/"
         method: GET
-        status_code: [200, 302]
+        status_code:
+          - 200
+          - 302
         timeout: 30
       register: http_check
       retries: 10
       delay: 15
       until: http_check.status in [200, 302]
 
-    # -------------------------------------------------------------------------
-    # STATUS REPORT
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 11. FINAL STATUS REPORT
+    # =========================================================================
 
     - name: Get final container status
       command: docker compose ps
@@ -275,7 +382,7 @@
       debug:
         msg: "{{ compose_status.stdout_lines }}"
 
-    - name: Show DefectDojo access information
+    - name: DefectDojo access information
       debug:
         msg:
           - "========================================"
