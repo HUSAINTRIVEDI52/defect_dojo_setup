@@ -2,7 +2,7 @@ name: Infrastructure Setup (Permanent)
 
 on:
   workflow_dispatch:
-    push:
+  push:
     branches:
       - Infra-Pipeline
 
@@ -84,7 +84,7 @@ jobs:
               break
             fi
             if [ $i -eq 24 ]; then
-              echo "VM never reached RUNNING state after 4 minutes"
+              echo "VM never reached RUNNING state"
               exit 1
             fi
             sleep 10
@@ -110,7 +110,7 @@ jobs:
             echo "  Attempt $i/30 - retrying in 10s..."
             sleep 10
           done
-          echo "SSH failed to become ready after 5 minutes"
+          echo "SSH failed to become ready"
           exit 1
 
       - name: Copy Ansible files to VM
@@ -130,8 +130,6 @@ jobs:
           echo "Ansible files copied to VM"
 
       - name: Bootstrap VM — install Docker CE + Ansible
-        # This runs BEFORE Ansible so Docker is installed the right way
-        # (from Docker's official repo, not docker.io) before Ansible touches it.
         run: |
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
@@ -143,7 +141,7 @@ jobs:
 
             echo "========== VM Bootstrap =========="
 
-            # Wait for cloud-init to finish
+            # Wait for cloud-init
             echo "Waiting for cloud-init..."
             sudo cloud-init status --wait 2>/dev/null || true
             sleep 15
@@ -168,18 +166,18 @@ jobs:
               sleep 15
             done
 
-            # Install prerequisites
-            echo "Installing prerequisites..."
+            # Install Ansible + prerequisites ONLY (no docker.io)
+            echo "Installing Ansible + prerequisites..."
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
               ca-certificates curl gnupg lsb-release \
               software-properties-common ansible python3-pip git
 
-            # Remove old docker packages
+            # Remove old docker packages if present
             echo "Removing old docker packages..."
             sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y \
               docker.io docker-compose containerd 2>/dev/null || true
 
-            # Add Docker's official GPG key + repo
+            # Add Docker's official GPG key
             echo "Adding Docker official repo..."
             sudo install -m 0755 -d /etc/apt/keyrings
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -193,7 +191,7 @@ jobs:
 
             sudo apt-get update -qq
 
-            # Install Docker CE + Compose plugin
+            # Install Docker CE + Compose plugin from official repo
             echo "Installing Docker CE..."
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
               docker-ce docker-ce-cli containerd.io \
@@ -202,7 +200,7 @@ jobs:
             sudo systemctl enable docker
             sudo systemctl start docker
 
-            # Wait for Docker daemon
+            # Wait for Docker daemon to be ready
             echo "Waiting for Docker daemon..."
             for i in $(seq 1 20); do
               if sudo docker info > /dev/null 2>&1; then
@@ -247,6 +245,11 @@ jobs:
             tar -xzf ~/ansible.tar.gz
             cd ~/ansible
 
+            # Confirm site.yml has the correct new content before running
+            echo "--- First task in site.yml ---"
+            grep "name:" site.yml | head -5
+            echo "------------------------------"
+
             sudo ansible-playbook -i localhost, -c local site.yml \
               -e "db_password=${{ secrets.DB_PASSWORD }}" \
               -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
@@ -268,7 +271,7 @@ jobs:
             echo "=== docker compose ps ==="
             cd /opt/defectdojo 2>/dev/null \
               && sudo docker compose ps \
-              || echo "No compose state found — DefectDojo dir does not exist"
+              || echo "No compose state found"
 
             echo ""
             echo "=== initializer logs ==="
@@ -287,7 +290,8 @@ jobs:
             echo ""
             echo "=== docker version ==="
             sudo docker --version
-            sudo docker compose version 2>/dev/null || echo "docker compose plugin NOT found"
+            sudo docker compose version 2>/dev/null \
+              || echo "docker compose plugin NOT found"
 
             echo ""
             echo "=== disk usage ==="
@@ -309,7 +313,6 @@ jobs:
             echo "  Attempt $i/20 — HTTP $HTTP_CODE — retrying in 15s..."
             sleep 15
           done
-          # Not a hard failure — app may need a bit more time
           echo "DefectDojo not reachable yet — check http://${{ env.INSTANCE_IP }}:8080 manually"
           exit 0
 

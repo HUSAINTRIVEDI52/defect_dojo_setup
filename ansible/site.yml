@@ -30,8 +30,6 @@
 
     # =========================================================================
     # 2. DOCKER CE + COMPOSE PLUGIN (official Docker repo — NOT docker.io)
-    #    docker.io from Ubuntu apt does NOT ship docker-compose-plugin.
-    #    DefectDojo's docker-compose.yml uses 'docker compose' (plugin syntax).
     # =========================================================================
 
     - name: Create Docker apt keyring directory
@@ -112,7 +110,7 @@
         msg: "{{ compose_ver.stdout }}"
 
     # =========================================================================
-    # 3. SWAP — safety net in case RAM is borderline under load
+    # 3. SWAP — safety net in case RAM is tight under load
     # =========================================================================
 
     - name: Check if swapfile already exists
@@ -253,7 +251,6 @@
         MAX=60
         i=0
         while [ $i -lt $MAX ]; do
-          # Use pg_isready inside the container — most reliable health check
           if docker exec defectdojo-postgres-1 \
               pg_isready -U defectdojo -d defectdojo > /dev/null 2>&1; then
             echo "OK: postgres is accepting connections"
