@@ -5,13 +5,12 @@
   become: true
 
   vars:
-    db_password: "{{ db_password | default('defectdojo') }}"
+    # Use hardcoded defaults — GitHub secrets are passed via -e flags
+    # If the secret is empty, the default below is used instead
+    db_password: "{{ db_password | default('Defectdojo1234!') }}"
     dd_admin_password: "{{ dd_admin_password | default('Admin1234!') }}"
     dd_secret_key: "{{ dd_secret_key | default('hhZCp@D28z!n@NED*yB!ROMt+WzsY*Vy') }}"
     defectdojo_dir: /opt/defectdojo
-    # NEW: env file is now inside dojo/settings/ not at root
-    env_template: "{{ defectdojo_dir }}/dojo/settings/template-env"
-    env_dest: "{{ defectdojo_dir }}/dojo/settings/.env.prod"
 
   tasks:
 
@@ -32,7 +31,7 @@
         update_cache: yes
 
     # =========================================================================
-    # 2. DOCKER CE + COMPOSE PLUGIN (official Docker repo — NOT docker.io)
+    # 2. DOCKER CE + COMPOSE PLUGIN
     # =========================================================================
 
     - name: Create Docker apt keyring directory
@@ -113,7 +112,7 @@
         msg: "{{ compose_ver.stdout }}"
 
     # =========================================================================
-    # 3. SWAP — safety net in case RAM is tight under load
+    # 3. SWAP
     # =========================================================================
 
     - name: Check if swapfile already exists
@@ -149,7 +148,7 @@
         msg: "{{ mem_status.stdout_lines }}"
 
     # =========================================================================
-    # 4. CLEAN SLATE — remove any previous broken attempt
+    # 4. CLEAN SLATE
     # =========================================================================
 
     - name: Check if defectdojo directory exists from a previous run
@@ -171,7 +170,7 @@
       when: dojo_dir_stat.stat.exists
 
     # =========================================================================
-    # 5. CLONE & CONFIGURE
+    # 5. CLONE
     # =========================================================================
 
     - name: Clone DefectDojo repository
@@ -182,87 +181,98 @@
         force: yes
         depth: 1
 
-    - name: Show what env-related files exist after clone
-      shell: |
-        echo "=== Root level env files ==="
-        ls -la {{ defectdojo_dir }}/.env* 2>/dev/null || echo "none at root"
-        echo "=== dojo/settings env files ==="
-        ls -la {{ defectdojo_dir }}/dojo/settings/.env* 2>/dev/null || echo "none in dojo/settings"
-        echo "=== dojo/settings template files ==="
-        ls -la {{ defectdojo_dir }}/dojo/settings/template* 2>/dev/null || echo "none"
-      register: env_files_check
-      changed_when: false
+    # =========================================================================
+    # 6. WRITE docker-compose.override.yml
+    #    This is the CORRECT way to pass credentials to DefectDojo.
+    #    The new repo reads credentials via docker-compose env vars, not .env.prod.
+    #    We override POSTGRES_PASSWORD so postgres and the app use the same value.
+    # =========================================================================
 
-    - name: Display found env files
-      debug:
-        msg: "{{ env_files_check.stdout_lines }}"
-
-    - name: Confirm env template exists at new location
-      stat:
-        path: "{{ env_template }}"
-      register: env_template_stat
-      failed_when: not env_template_stat.stat.exists
-
-    - name: Copy env template to .env.prod
+    - name: Write docker-compose.override.yml with all credentials
       copy:
-        src: "{{ env_template }}"
-        dest: "{{ env_dest }}"
-        remote_src: yes
+        dest: "{{ defectdojo_dir }}/docker-compose.override.yml"
+        content: |
+          services:
+            postgres:
+              environment:
+                POSTGRES_PASSWORD: "{{ db_password }}"
+                POSTGRES_USER: "defectdojo"
+                POSTGRES_DB: "defectdojo"
+            initializer:
+              environment:
+                DD_DATABASE_PASSWORD: "{{ db_password }}"
+                DD_DATABASE_USER: "defectdojo"
+                DD_DATABASE_NAME: "defectdojo"
+                DD_DATABASE_HOST: "postgres"
+                DD_DATABASE_PORT: "5432"
+                DD_ADMIN_USER: "admin"
+                DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
+                DD_ADMIN_MAIL: "admin@defectdojo.local"
+                DD_SECRET_KEY: "{{ dd_secret_key }}"
+                DD_ALLOWED_HOSTS: "*"
+                DD_DEBUG: "False"
+            uwsgi:
+              environment:
+                DD_DATABASE_PASSWORD: "{{ db_password }}"
+                DD_DATABASE_USER: "defectdojo"
+                DD_DATABASE_NAME: "defectdojo"
+                DD_DATABASE_HOST: "postgres"
+                DD_DATABASE_PORT: "5432"
+                DD_ADMIN_USER: "admin"
+                DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
+                DD_ADMIN_MAIL: "admin@defectdojo.local"
+                DD_SECRET_KEY: "{{ dd_secret_key }}"
+                DD_ALLOWED_HOSTS: "*"
+                DD_DEBUG: "False"
+            celeryworker:
+              environment:
+                DD_DATABASE_PASSWORD: "{{ db_password }}"
+                DD_DATABASE_USER: "defectdojo"
+                DD_DATABASE_NAME: "defectdojo"
+                DD_DATABASE_HOST: "postgres"
+                DD_DATABASE_PORT: "5432"
+                DD_SECRET_KEY: "{{ dd_secret_key }}"
+                DD_ALLOWED_HOSTS: "*"
+            celerybeat:
+              environment:
+                DD_DATABASE_PASSWORD: "{{ db_password }}"
+                DD_DATABASE_USER: "defectdojo"
+                DD_DATABASE_NAME: "defectdojo"
+                DD_DATABASE_HOST: "postgres"
+                DD_DATABASE_PORT: "5432"
+                DD_SECRET_KEY: "{{ dd_secret_key }}"
+                DD_ALLOWED_HOSTS: "*"
 
-    - name: Configure all DefectDojo environment variables
-      lineinfile:
-        path: "{{ env_dest }}"
-        regexp: "{{ item.regexp }}"
-        line: "{{ item.line }}"
-        create: yes
-      loop:
-        - { regexp: '^DD_DATABASE_PASSWORD=',  line: 'DD_DATABASE_PASSWORD={{ db_password }}' }
-        - { regexp: '^DD_ADMIN_PASSWORD=',      line: 'DD_ADMIN_PASSWORD={{ dd_admin_password }}' }
-        - { regexp: '^DD_SECRET_KEY=',          line: 'DD_SECRET_KEY={{ dd_secret_key }}' }
-        - { regexp: '^DD_ALLOWED_HOSTS=',       line: 'DD_ALLOWED_HOSTS=*' }
-        - { regexp: '^DD_DEBUG=',               line: 'DD_DEBUG=False' }
-        - { regexp: '^DD_ADMIN_USER=',          line: 'DD_ADMIN_USER=admin' }
-        - { regexp: '^DD_ADMIN_MAIL=',          line: 'DD_ADMIN_MAIL=admin@defectdojo.local' }
-        - { regexp: '^DD_DATABASE_HOST=',       line: 'DD_DATABASE_HOST=postgres' }
-        - { regexp: '^DD_DATABASE_PORT=',       line: 'DD_DATABASE_PORT=5432' }
-        - { regexp: '^DD_DATABASE_NAME=',       line: 'DD_DATABASE_NAME=defectdojo' }
-        - { regexp: '^DD_DATABASE_USER=',       line: 'DD_DATABASE_USER=defectdojo' }
-
-    - name: Confirm .env.prod was written correctly
-      shell: grep -c "DD_DATABASE_PASSWORD" "{{ env_dest }}"
-      register: env_check
+    - name: Confirm override file was written
+      shell: cat "{{ defectdojo_dir }}/docker-compose.override.yml"
+      register: override_check
       changed_when: false
-      failed_when: env_check.rc != 0
+
+    - name: Display override file contents (passwords masked)
+      debug:
+        msg: "Override file written with {{ (override_check.stdout_lines | length) }} lines"
 
     # =========================================================================
-    # 6. PULL IMAGES
+    # 7. PULL IMAGES
     # =========================================================================
 
     - name: Pull all Docker images
       command: docker compose pull
       args:
         chdir: "{{ defectdojo_dir }}"
-      environment:
-        DD_DATABASE_PASSWORD: "{{ db_password }}"
-        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
-        DD_SECRET_KEY: "{{ dd_secret_key }}"
       register: pull_result
       retries: 3
       delay: 15
       until: pull_result.rc == 0
 
     # =========================================================================
-    # 7. START POSTGRES + VALKEY FIRST
+    # 8. START POSTGRES + VALKEY FIRST
     # =========================================================================
 
     - name: Start postgres and valkey containers
       command: docker compose up -d postgres valkey
       args:
         chdir: "{{ defectdojo_dir }}"
-      environment:
-        DD_DATABASE_PASSWORD: "{{ db_password }}"
-        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
-        DD_SECRET_KEY: "{{ dd_secret_key }}"
 
     - name: Wait for postgres to accept connections (up to 5 minutes)
       shell: |
@@ -292,17 +302,13 @@
         msg: "{{ postgres_health.stdout_lines }}"
 
     # =========================================================================
-    # 8. RUN INITIALIZER
+    # 9. RUN INITIALIZER
     # =========================================================================
 
     - name: Start initializer container
       command: docker compose up -d initializer
       args:
         chdir: "{{ defectdojo_dir }}"
-      environment:
-        DD_DATABASE_PASSWORD: "{{ db_password }}"
-        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
-        DD_SECRET_KEY: "{{ dd_secret_key }}"
 
     - name: Wait for initializer to complete (up to 20 minutes)
       shell: |
@@ -345,20 +351,16 @@
         msg: "{{ initializer_wait.stdout_lines }}"
 
     # =========================================================================
-    # 9. START ALL REMAINING SERVICES
+    # 10. START ALL REMAINING SERVICES
     # =========================================================================
 
     - name: Start all remaining DefectDojo services
       command: docker compose up -d
       args:
         chdir: "{{ defectdojo_dir }}"
-      environment:
-        DD_DATABASE_PASSWORD: "{{ db_password }}"
-        DD_ADMIN_PASSWORD: "{{ dd_admin_password }}"
-        DD_SECRET_KEY: "{{ dd_secret_key }}"
 
     # =========================================================================
-    # 10. WAIT FOR WEB INTERFACE
+    # 11. WAIT FOR WEB INTERFACE
     # =========================================================================
 
     - name: Wait for nginx to expose port 8080 (up to 10 minutes)
@@ -383,7 +385,7 @@
       until: http_check.status in [200, 302]
 
     # =========================================================================
-    # 11. FINAL STATUS REPORT
+    # 12. FINAL STATUS REPORT
     # =========================================================================
 
     - name: Get final container status
