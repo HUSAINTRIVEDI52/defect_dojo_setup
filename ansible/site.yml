@@ -9,6 +9,9 @@
     dd_admin_password: "{{ dd_admin_password | default('Admin1234!') }}"
     dd_secret_key: "{{ dd_secret_key | default('hhZCp@D28z!n@NED*yB!ROMt+WzsY*Vy') }}"
     defectdojo_dir: /opt/defectdojo
+    # NEW: env file is now inside dojo/settings/ not at root
+    env_template: "{{ defectdojo_dir }}/dojo/settings/template-env"
+    env_dest: "{{ defectdojo_dir }}/dojo/settings/.env.prod"
 
   tasks:
 
@@ -179,21 +182,36 @@
         force: yes
         depth: 1
 
-    - name: Confirm .env.prod.template exists in repo
-      stat:
-        path: "{{ defectdojo_dir }}/.env.prod.template"
-      register: env_template
-      failed_when: not env_template.stat.exists
+    - name: Show what env-related files exist after clone
+      shell: |
+        echo "=== Root level env files ==="
+        ls -la {{ defectdojo_dir }}/.env* 2>/dev/null || echo "none at root"
+        echo "=== dojo/settings env files ==="
+        ls -la {{ defectdojo_dir }}/dojo/settings/.env* 2>/dev/null || echo "none in dojo/settings"
+        echo "=== dojo/settings template files ==="
+        ls -la {{ defectdojo_dir }}/dojo/settings/template* 2>/dev/null || echo "none"
+      register: env_files_check
+      changed_when: false
 
-    - name: Copy .env.prod from template
+    - name: Display found env files
+      debug:
+        msg: "{{ env_files_check.stdout_lines }}"
+
+    - name: Confirm env template exists at new location
+      stat:
+        path: "{{ env_template }}"
+      register: env_template_stat
+      failed_when: not env_template_stat.stat.exists
+
+    - name: Copy env template to .env.prod
       copy:
-        src: "{{ defectdojo_dir }}/.env.prod.template"
-        dest: "{{ defectdojo_dir }}/.env.prod"
+        src: "{{ env_template }}"
+        dest: "{{ env_dest }}"
         remote_src: yes
 
     - name: Configure all DefectDojo environment variables
       lineinfile:
-        path: "{{ defectdojo_dir }}/.env.prod"
+        path: "{{ env_dest }}"
         regexp: "{{ item.regexp }}"
         line: "{{ item.line }}"
         create: yes
@@ -211,7 +229,7 @@
         - { regexp: '^DD_DATABASE_USER=',       line: 'DD_DATABASE_USER=defectdojo' }
 
     - name: Confirm .env.prod was written correctly
-      shell: grep -c "DD_DATABASE_PASSWORD" "{{ defectdojo_dir }}/.env.prod"
+      shell: grep -c "DD_DATABASE_PASSWORD" "{{ env_dest }}"
       register: env_check
       changed_when: false
       failed_when: env_check.rc != 0
