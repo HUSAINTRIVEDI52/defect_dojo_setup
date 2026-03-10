@@ -323,32 +323,79 @@
     # =========================================================================
     # 10. FORCE-RESET ADMIN PASSWORD VIA DJANGO (belt-and-suspenders)
     #
-    #     FIX 5: Even if the initializer set the wrong password, this step
-    #     explicitly resets it using Django's changepassword / shell command.
-    #     This runs AFTER the initializer so the user definitely exists.
+    #     FIX 5: Use `docker exec` on the ALREADY-RUNNING uwsgi container
+    #     instead of `docker compose run` (which spins up a new container
+    #     and hangs waiting for full stack init).
+    #
+    #     We write the Python snippet to a temp file inside the container
+    #     to completely avoid shell quoting/escaping issues.
     # =========================================================================
 
-    - name: Force-set admin password via Django management command
+    - name: Wait for uwsgi container to be running before exec
       shell: |
-        docker compose --env-file .env run --rm \
-          -e DJANGO_SUPERUSER_PASSWORD={{ _dd_admin_password | quote }} \
-          uwsgi \
-          bash -c "python manage.py shell -c \"
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-        u = User.objects.get(username='admin')
-        u.set_password('{{ _dd_admin_password }}')
-        u.save()
-        print('Password reset OK for user:', u.username)
-        \""
-      args:
-        chdir: "{{ defectdojo_dir }}"
+        MAX=60
+        i=0
+        while [ $i -lt $MAX ]; do
+          STATUS=$(docker inspect --format='{{ "{{" }}.State.Status{{ "}}" }}' \
+            defectdojo-uwsgi-1 2>/dev/null || echo "missing")
+          echo "  uwsgi status: $STATUS (attempt $((i+1))/$MAX)"
+          if [ "$STATUS" = "running" ]; then
+            echo "OK: uwsgi is running"
+            exit 0
+          fi
+          sleep 5
+          i=$((i+1))
+        done
+        echo "FAIL: uwsgi container never became running"
+        exit 1
+      register: uwsgi_wait
+      failed_when: uwsgi_wait.rc != 0
+
+    - name: Show uwsgi wait result
+      debug:
+        msg: "{{ uwsgi_wait.stdout_lines }}"
+
+    - name: Write Django password-reset script to temp file on host
+      # Writing to a file avoids ALL shell quoting issues with special chars
+      # in passwords (!, @, #, spaces, quotes, etc.)
+      copy:
+        dest: /tmp/dd_reset_pw.py
+        mode: '0600'
+        content: |
+          from django.contrib.auth import get_user_model
+          User = get_user_model()
+          try:
+              u = User.objects.get(username='admin')
+              u.set_password("""{{ _dd_admin_password }}""")
+              u.save()
+              print("SUCCESS: password reset for user:", u.username)
+          except User.DoesNotExist:
+              print("ERROR: admin user not found")
+              raise SystemExit(1)
+
+    - name: Copy password-reset script into the uwsgi container
+      command: docker cp /tmp/dd_reset_pw.py defectdojo-uwsgi-1:/tmp/dd_reset_pw.py
+
+    - name: Execute Django password reset via docker exec
+      # docker exec on running container — no startup delay, no quoting issues
+      command: >
+        docker exec defectdojo-uwsgi-1
+        python manage.py shell --command="exec(open('/tmp/dd_reset_pw.py').read())"
       register: pw_reset
       failed_when: pw_reset.rc != 0
 
     - name: Show password reset result
       debug:
         msg: "{{ pw_reset.stdout_lines }}"
+
+    - name: Clean up temp password script from host
+      file:
+        path: /tmp/dd_reset_pw.py
+        state: absent
+
+    - name: Clean up temp password script from container
+      command: docker exec defectdojo-uwsgi-1 rm -f /tmp/dd_reset_pw.py
+      ignore_errors: yes
 
     # =========================================================================
     # 11. START ALL REMAINING SERVICES
