@@ -300,8 +300,18 @@
     # =========================================================================
 
     - name: Run initializer synchronously — blocks until DB is fully initialized
+      # ROOT CAUSE FIX:
+      # `docker compose run` does NOT pass .env values as container env vars.
+      # The .env file is only used for variable substitution in docker-compose.yml.
+      # DD_ADMIN_PASSWORD must be explicitly injected with -e flag.
       shell: |
-        docker compose --env-file .env run --rm --no-deps initializer
+        docker compose --env-file .env run --rm --no-deps \
+          -e DD_ADMIN_PASSWORD={{ _dd_admin_password | quote }} \
+          -e DD_ADMIN_USER=admin \
+          -e DD_ADMIN_MAIL=admin@defectdojo.local \
+          -e DD_ADMIN_FIRST_NAME=Admin \
+          -e DD_ADMIN_LAST_NAME=User \
+          initializer
       args:
         chdir: "{{ defectdojo_dir }}"
       register: initializer_result
@@ -365,26 +375,47 @@
 
     # =========================================================================
     # 12. SMOKE TEST — verify login works with the configured password
+    #
+    #     DefectDojo API v2 does NOT support Basic Auth on /api/v2/user/.
+    #     Correct flow:
+    #       POST credentials to /api/v2/auth-token/ -> get token
+    #       Use "Authorization: Token <token>" for subsequent calls
     # =========================================================================
 
-    - name: Smoke-test login via API with configured admin password
+    - name: Smoke-test — obtain API auth token with configured password
+      uri:
+        url: "http://127.0.0.1:8080/api/v2/auth-token/"
+        method: POST
+        body_format: json
+        body:
+          username: "admin"
+          password: "{{ _dd_admin_password }}"
+        status_code: 200
+        timeout: 30
+      register: token_result
+      retries: 5
+      delay: 10
+      until: token_result.status == 200
+      no_log: true
+
+    - name: Confirm smoke test passed — token obtained successfully
+      debug:
+        msg: "Login verified — API token obtained. Password is correct."
+
+    - name: Smoke-test — verify token works on /api/v2/user/
       uri:
         url: "http://127.0.0.1:8080/api/v2/user/"
         method: GET
-        user: admin
-        password: "{{ _dd_admin_password }}"
-        force_basic_auth: yes
+        headers:
+          Authorization: "Token {{ token_result.json.token }}"
         status_code: 200
         timeout: 30
-      register: login_test
-      retries: 5
-      delay: 10
-      until: login_test.status == 200
+      register: user_result
       no_log: true
 
-    - name: Confirm login smoke test passed
+    - name: Show logged-in user info
       debug:
-        msg: "Login verified successfully via API — admin password is correct."
+        msg: "Logged in as: {{ user_result.json.results[0].username }} (id={{ user_result.json.results[0].id }})" 
 
     # =========================================================================
     # 13. FINAL STATUS
