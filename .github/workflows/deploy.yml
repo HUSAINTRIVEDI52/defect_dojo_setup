@@ -2,6 +2,9 @@ name: Infrastructure Setup (Permanent)
 
 on:
   workflow_dispatch:
+    push:
+    branches:
+      - Infra-Pipeline
 
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
