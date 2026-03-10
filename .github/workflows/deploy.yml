@@ -2,6 +2,9 @@ name: Infrastructure Setup (Permanent)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - Infra-Pipeline
 
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -44,11 +47,14 @@ jobs:
         working-directory: infrastructure/gcp
         run: |
           terraform init
+          # IMPORTANT: DefectDojo needs minimum 4GB RAM.
+          # e2-micro (1GB) will OOM-kill the initializer — use e2-standard-2 (8GB) minimum.
+          # e2-medium (4GB) works but is tight; e2-standard-2 is recommended for stability.
           terraform apply -auto-approve \
             -var="project_id=${{ secrets.GCP_PROJECT_ID }}" \
             -var="region=${{ env.GCP_REGION }}" \
             -var="zone=${{ env.GCP_ZONE }}" \
-            -var="machine_type=e2-micro"
+            -var="machine_type=e2-standard-2"
           echo "INSTANCE_IP=$(terraform output -raw instance_ip)"     >> $GITHUB_ENV
           echo "INSTANCE_NAME=$(terraform output -raw instance_name)" >> $GITHUB_ENV
 
@@ -67,19 +73,22 @@ jobs:
         run: |
           ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N "" -C "github-actions-temp"
           chmod 600 ~/.ssh/deploy_key
-          echo "SSH key generated"
 
       - name: Push SSH public key to VM via gcloud
         run: |
-          echo "Waiting for VM to be ready..."
-          for i in $(seq 1 12); do
+          echo "Waiting for VM to be RUNNING..."
+          for i in $(seq 1 24); do
             STATUS=$(gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
               --zone=${{ env.GCP_ZONE }} \
               --format="value(status)" 2>/dev/null || echo "UNKNOWN")
-            echo "  VM status: $STATUS"
+            echo "  VM status: $STATUS (attempt $i/24)"
             if [ "$STATUS" = "RUNNING" ]; then
-              echo "VM is running"
+              echo "✓ VM is RUNNING"
               break
+            fi
+            if [ $i -eq 24 ]; then
+              echo "✗ VM never reached RUNNING state"
+              exit 1
             fi
             sleep 10
           done
@@ -87,15 +96,13 @@ jobs:
           gcloud compute instances add-metadata ${{ env.INSTANCE_NAME }} \
             --zone=${{ env.GCP_ZONE }} \
             --metadata="ssh-keys=${{ env.VM_USER }}:$(cat ~/.ssh/deploy_key.pub)"
-
-          echo "SSH public key pushed to VM"
+          echo "✓ SSH public key pushed to VM"
 
       - name: Wait for SSH to be ready
         run: |
-          echo "Waiting for SSH service to start..."
+          echo "Waiting for SSH service..."
           sleep 20
-
-          for i in $(seq 1 20); do
+          for i in $(seq 1 30); do
             if ssh -i ~/.ssh/deploy_key \
                 -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
@@ -105,32 +112,26 @@ jobs:
               echo "✓ SSH is ready"
               exit 0
             fi
-            echo "  Attempt $i/20 - retrying in 10s..."
+            echo "  Attempt $i/30 - retrying in 10s..."
             sleep 10
           done
-          
-          echo "✗ SSH failed to become ready"
+          echo "✗ SSH failed to become ready after 5 minutes"
           exit 1
 
       - name: Copy Ansible files to VM
         run: |
           cd "${GITHUB_WORKSPACE}"
-          
-          # Verify ansible directory exists
           if [ ! -d "ansible" ]; then
-            echo "ERROR: ansible directory not found!"
+            echo "✗ ERROR: ansible directory not found in workspace!"
             ls -la
             exit 1
           fi
-          
           tar -czf ansible.tar.gz ansible/
-          
           scp -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             ansible.tar.gz \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }}:~/ansible.tar.gz
-          
           echo "✓ Ansible files copied"
 
       - name: Run Ansible playbook on VM
@@ -138,100 +139,183 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=60 \
             ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'ENDSSH'
             set -e
-            
+
             echo "=========================================="
             echo "Setting up DefectDojo on VM"
             echo "=========================================="
-            
+
             # Wait for cloud-init to complete
             echo "⏳ Waiting for cloud-init..."
             sudo cloud-init status --wait 2>/dev/null || true
-            
-            # Wait for system to stabilize
-            echo "⏳ Waiting for system to stabilize..."
+
+            # Give system time to settle
+            echo "⏳ Letting system settle (30s)..."
             sleep 30
-            
-            # Stop unattended upgrades to avoid lock conflicts
+
+            # Stop unattended upgrades to avoid dpkg lock conflicts
             echo "🛑 Stopping unattended-upgrades..."
             sudo systemctl stop unattended-upgrades 2>/dev/null || true
+            sudo systemctl disable unattended-upgrades 2>/dev/null || true
             sudo killall -9 unattended-upgrade apt-get apt 2>/dev/null || true
             sleep 5
-            
+
+            # Release any dpkg locks
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+            sudo dpkg --configure -a 2>/dev/null || true
+
             # Enable universe repository
             echo "📦 Enabling universe repository..."
             sudo add-apt-repository universe -y
-            
+
             # Update package lists with retry
             echo "🔄 Updating package lists..."
             for i in {1..5}; do
-              if sudo apt-get update; then
+              if sudo apt-get update -qq; then
                 echo "✓ Package lists updated"
                 break
               fi
-              echo "  Retry $i/5 in 10s..."
-              sleep 10
+              echo "  Retry $i/5 in 15s..."
+              sleep 15
             done
-            
-            # Install dependencies
+
+            # Install Ansible
             echo "📥 Installing Ansible..."
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
               software-properties-common \
-              ansible
-            
+              ansible \
+              python3-pip
+
+            # Install Docker
             echo "📥 Installing Docker..."
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
             sudo systemctl enable docker
             sudo systemctl start docker
-            
+
+            # Wait for Docker to be truly ready
+            echo "⏳ Waiting for Docker daemon..."
+            for i in {1..12}; do
+              if sudo docker info > /dev/null 2>&1; then
+                echo "✓ Docker is ready"
+                break
+              fi
+              echo "  Waiting for Docker... attempt $i/12"
+              sleep 5
+            done
+
+            # Install Docker Compose plugin (preferred) with fallback
             echo "📥 Installing Docker Compose..."
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              docker-compose-plugin 2>/dev/null || \
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin 2>/dev/null; then
+              echo "✓ docker-compose-plugin installed"
+            else
+              echo "⚠ Falling back to standalone docker-compose..."
               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose
-            
-            # Verify installations
-            echo "✓ Ansible version: $(ansible --version | head -n1)"
-            echo "✓ Docker version: $(docker --version)"
-            echo "✓ Docker Compose version: $(docker compose version 2>/dev/null || docker-compose version)"
-            
+            fi
+
+            # Verify all tools are present
+            echo ""
+            echo "--- Tool Versions ---"
+            ansible --version | head -n1
+            sudo docker --version
+            sudo docker compose version 2>/dev/null || docker-compose version
+            echo "---------------------"
+            echo ""
+
+            # Verify system has enough RAM (warn if < 3GB)
+            TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+            TOTAL_RAM_GB=$((TOTAL_RAM_KB / 1024 / 1024))
+            echo "⚙ System RAM: ~${TOTAL_RAM_GB}GB"
+            if [ "$TOTAL_RAM_GB" -lt 3 ]; then
+              echo "⚠ WARNING: Less than 3GB RAM detected!"
+              echo "  DefectDojo requires minimum 4GB RAM."
+              echo "  The initializer container WILL likely fail."
+              echo "  Please use machine_type=e2-standard-2 or larger."
+              # Do NOT exit here — let it try and give you the real logs
+            fi
+
+            # Add swap space if RAM is low (helps on tight machines)
+            if [ "$TOTAL_RAM_GB" -lt 4 ]; then
+              echo "📦 Adding 4GB swap space to supplement RAM..."
+              if [ ! -f /swapfile ]; then
+                sudo fallocate -l 4G /swapfile
+                sudo chmod 600 /swapfile
+                sudo mkswap /swapfile
+                sudo swapon /swapfile
+                echo "✓ Swap space added"
+                free -h
+              fi
+            fi
+
             # Extract and run Ansible playbook
             echo "📂 Extracting Ansible files..."
             tar -xzf ~/ansible.tar.gz
-            
+
             echo "🚀 Running Ansible playbook..."
             cd ~/ansible
+
+            # Run with verbose output so we see every task
             sudo ansible-playbook -i localhost, -c local site.yml \
               -e "db_password=${{ secrets.DB_PASSWORD }}" \
               -e "dd_admin_password=${{ secrets.DD_ADMIN_PASSWORD }}" \
-              -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}"
-            
+              -e "dd_secret_key=${{ secrets.DD_SECRET_KEY }}" \
+              -v
+
             echo "=========================================="
             echo "✓ Ansible playbook completed successfully"
             echo "=========================================="
           ENDSSH
 
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          echo "🔍 Collecting debug logs from VM..."
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ${{ env.VM_USER }}@${{ env.INSTANCE_IP }} bash << 'DEBUGSSH' || true
+
+            echo "=== docker compose ps ==="
+            cd /opt/defectdojo && sudo docker compose ps 2>/dev/null || echo "no compose state"
+
+            echo ""
+            echo "=== initializer logs ==="
+            sudo docker logs defectdojo-initializer-1 2>&1 | tail -100 || echo "no initializer container"
+
+            echo ""
+            echo "=== postgres logs ==="
+            sudo docker logs defectdojo-postgres-1 2>&1 | tail -50 || echo "no postgres container"
+
+            echo ""
+            echo "=== system memory ==="
+            free -h
+
+            echo ""
+            echo "=== docker system df ==="
+            sudo docker system df
+          DEBUGSSH
+
       - name: Verify DefectDojo is accessible
         run: |
-          echo "Waiting for DefectDojo to start..."
-          sleep 45
-
-          for i in $(seq 1 15); do
+          echo "Waiting for DefectDojo to be accessible..."
+          sleep 30
+          for i in $(seq 1 20); do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 15 \
               "http://${{ env.INSTANCE_IP }}:8080/login?next=/" 2>/dev/null || echo "000")
-
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✓ DefectDojo is accessible - HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "✓ DefectDojo is accessible — HTTP $HTTP_CODE"
               exit 0
-            else
-              echo "  Attempt $i/15 - HTTP $HTTP_CODE - retrying in 15s..."
-              sleep 15
             fi
+            echo "  Attempt $i/20 — HTTP $HTTP_CODE — retrying in 15s..."
+            sleep 15
           done
-          
-          echo "⚠️  DefectDojo not accessible after 15 attempts"
-          echo "This may be normal if the application takes longer to start"
-          echo "Check manually at: http://${{ env.INSTANCE_IP }}:8080"
+          echo "⚠ DefectDojo not accessible after all attempts"
+          echo "  Check manually: http://${{ env.INSTANCE_IP }}:8080"
+          # Not a hard failure — app may still be initializing
+          exit 0
 
       - name: Remove temporary SSH key from VM
         if: always()
@@ -250,29 +334,27 @@ jobs:
           echo ""
           echo "  🌐 URL:      http://${{ env.INSTANCE_IP }}:8080"
           echo "  👤 Username: admin"
-          echo "  🔑 Password: (Use DD_ADMIN_PASSWORD secret)"
+          echo "  🔑 Password: (DD_ADMIN_PASSWORD secret)"
           echo ""
-          echo "  🔌 SSH:      ssh ubuntu@${{ env.INSTANCE_IP }}"
-          echo ""
+          echo "  🔌 SSH:  ssh ubuntu@${{ env.INSTANCE_IP }}"
           echo "=============================================="
-          echo ""
 
       - name: Debug information on failure
         if: failure()
         run: |
           echo ""
           echo "=========================================="
-          echo "⚠️  Deployment Failed - Debug Info"
+          echo "⚠ Deployment Failed — Debug Info"
           echo "=========================================="
+          echo "  Instance: ${{ env.INSTANCE_NAME }}"
+          echo "  IP:       ${{ env.INSTANCE_IP }}"
+          echo "  Zone:     ${{ env.GCP_ZONE }}"
           echo ""
-          echo "Instance: ${{ env.INSTANCE_NAME }}"
-          echo "IP: ${{ env.INSTANCE_IP }}"
-          echo "Zone: ${{ env.GCP_ZONE }}"
-          echo ""
-          echo "Try manual SSH:"
+          echo "  SSH into VM:"
           echo "  gcloud compute ssh ${{ env.INSTANCE_NAME }} --zone=${{ env.GCP_ZONE }}"
           echo ""
-          echo "Check logs:"
-          echo "  gcloud compute instances get-serial-port-output ${{ env.INSTANCE_NAME }} --zone=${{ env.GCP_ZONE }}"
-          echo ""
+          echo "  Then check:"
+          echo "  cd /opt/defectdojo && sudo docker compose logs initializer"
+          echo "  sudo docker compose logs postgres"
+          echo "  sudo docker compose ps"
           echo "=========================================="
