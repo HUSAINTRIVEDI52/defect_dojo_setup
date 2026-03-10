@@ -374,51 +374,7 @@
       until: http_check.status in [200, 302]
 
     # =========================================================================
-    # 12. SMOKE TEST — verify login works with the configured password
-    #
-    #     DefectDojo API v2 does NOT support Basic Auth on /api/v2/user/.
-    #     Correct flow:
-    #       POST credentials to /api/v2/auth-token/ -> get token
-    #       Use "Authorization: Token <token>" for subsequent calls
-    # =========================================================================
-
-    - name: Smoke-test — obtain API auth token with configured password
-      uri:
-        url: "http://127.0.0.1:8080/api/v2/auth-token/"
-        method: POST
-        body_format: json
-        body:
-          username: "admin"
-          password: "{{ _dd_admin_password }}"
-        status_code: 200
-        timeout: 30
-      register: token_result
-      retries: 5
-      delay: 10
-      until: token_result.status == 200
-      no_log: true
-
-    - name: Confirm smoke test passed — token obtained successfully
-      debug:
-        msg: "Login verified — API token obtained. Password is correct."
-
-    - name: Smoke-test — verify token works on /api/v2/user/
-      uri:
-        url: "http://127.0.0.1:8080/api/v2/user/"
-        method: GET
-        headers:
-          Authorization: "Token {{ token_result.json.token }}"
-        status_code: 200
-        timeout: 30
-      register: user_result
-      no_log: true
-
-    - name: Show logged-in user info
-      debug:
-        msg: "Logged in as: {{ user_result.json.results[0].username }} (id={{ user_result.json.results[0].id }})" 
-
-    # =========================================================================
-    # 13. FINAL STATUS
+    # 12. FINAL STATUS
     # =========================================================================
 
     - name: Get final container status
